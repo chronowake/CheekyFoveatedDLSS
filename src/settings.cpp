@@ -9,9 +9,9 @@
 namespace cheeky::foveated_dlss {
 namespace {
 
-std::atomic<bool> enabled{true};
+std::atomic<bool> enabled{false};
 std::atomic<bool> d3d11_use_d3d12_transport{false};
-std::atomic<bool> peripheral_dlaa_enabled{true};
+std::atomic<bool> peripheral_dlaa_enabled{false};
 std::atomic<std::uint32_t> peripheral_dlaa_scale_bits{0x3F400000U};
 std::atomic<std::uint32_t> center_preset{};
 std::atomic<std::uint32_t> peripheral_dlaa_preset{5U};
@@ -20,7 +20,7 @@ std::atomic<std::uint32_t> height_bits{0x3EE66666U};
 std::atomic<std::uint32_t> x_offset_bits{0x3F19999AU};
 std::atomic<std::uint32_t> height_offset_bits{0xBEE66666U};
 std::atomic<bool> invert_stereo_x_offset{false};
-std::atomic<bool> auto_stereo_alignment{true};
+std::atomic<bool> auto_stereo_alignment{false};
 std::atomic<std::uint32_t> aligned_height_offset_bits{};
 std::atomic<std::uint32_t> roundness_bits{};
 std::atomic<std::uint32_t> transition_bits{0x3D23D70AU};
@@ -35,11 +35,16 @@ std::atomic<bool> nr_enabled{false};
 std::atomic<bool> nr_foveated{true};
 std::atomic<bool> nr_use_sr_foveation{false};
 std::atomic<bool> nr_alignment_border_enabled{false};
-std::atomic<std::uint32_t> nr_width_bits{0x3F0F5C29U};
-std::atomic<std::uint32_t> nr_height_bits{0x3F0F5C29U};
+std::atomic<std::uint32_t> nr_width_bits{0x3ECCCCCDU};
+std::atomic<std::uint32_t> nr_height_bits{0x3ECCCCCDU};
+std::atomic<std::uint32_t> nr_center_x_bits{};
+std::atomic<std::uint32_t> nr_x_offset_bits{};
+std::atomic<std::uint32_t> nr_height_offset_bits{};
+std::atomic<std::uint32_t> nr_source_x_bits{};
+std::atomic<std::uint32_t> nr_source_y_bits{};
 std::atomic<std::uint32_t> nr_roundness_bits{};
-std::atomic<std::uint32_t> nr_transition_bits{0x3DA3D70AU};
-std::atomic<std::uint32_t> nr_working_scale_bits{0x3F4CCCCDU};
+std::atomic<std::uint32_t> nr_transition_bits{};
+std::atomic<std::uint32_t> nr_working_scale_bits{0x3F800000U};
 std::atomic<std::uint32_t> nr_preset{};
 std::atomic<std::uint32_t> nr_intensity_bits{0x3F800000U};
 std::atomic<std::uint32_t> nr_local_tone_bits{0x3F800000U};
@@ -135,12 +140,16 @@ Settings current_settings() noexcept {
     );
     settings.nr_enabled = nr_enabled.load(std::memory_order_acquire);
     settings.nr_foveated = nr_foveated.load(std::memory_order_acquire);
-    settings.nr_use_sr_foveation =
-        nr_use_sr_foveation.load(std::memory_order_acquire);
+    settings.nr_use_sr_foveation = false;
     settings.nr_alignment_border_enabled =
         nr_alignment_border_enabled.load(std::memory_order_acquire);
     settings.nr_width = load_float(nr_width_bits);
     settings.nr_height = load_float(nr_height_bits);
+    settings.nr_center_x = load_float(nr_center_x_bits);
+    settings.nr_x_offset = load_float(nr_x_offset_bits);
+    settings.nr_height_offset = load_float(nr_height_offset_bits);
+    settings.nr_source_x = load_float(nr_source_x_bits);
+    settings.nr_source_y = load_float(nr_source_y_bits);
     settings.nr_roundness = load_float(nr_roundness_bits);
     settings.nr_transition_width = load_float(nr_transition_bits);
     settings.nr_working_scale = load_float(nr_working_scale_bits);
@@ -162,15 +171,12 @@ Settings current_settings() noexcept {
 }
 
 void update_settings(const Settings& settings) noexcept {
-    enabled.store(settings.enabled, std::memory_order_release);
+    enabled.store(false, std::memory_order_release);
     d3d11_use_d3d12_transport.store(
         settings.d3d11_use_d3d12_transport,
         std::memory_order_release
     );
-    peripheral_dlaa_enabled.store(
-        settings.peripheral_dlaa_enabled,
-        std::memory_order_release
-    );
+    peripheral_dlaa_enabled.store(false, std::memory_order_release);
     store_float(
         peripheral_dlaa_scale_bits,
         std::clamp(settings.peripheral_dlaa_scale, 0.20F, 1.0F)
@@ -234,16 +240,21 @@ void update_settings(const Settings& settings) noexcept {
     );
     nr_enabled.store(settings.nr_enabled, std::memory_order_release);
     nr_foveated.store(settings.nr_foveated, std::memory_order_release);
-    nr_use_sr_foveation.store(
-        settings.nr_use_sr_foveation,
-        std::memory_order_release
-    );
+    nr_use_sr_foveation.store(false, std::memory_order_release);
     nr_alignment_border_enabled.store(
         settings.nr_alignment_border_enabled,
         std::memory_order_release
     );
     store_float(nr_width_bits, std::clamp(settings.nr_width, 0.20F, 1.0F));
     store_float(nr_height_bits, std::clamp(settings.nr_height, 0.20F, 1.0F));
+    store_float(nr_center_x_bits, std::clamp(settings.nr_center_x, -1.0F, 1.0F));
+    store_float(nr_x_offset_bits, std::clamp(settings.nr_x_offset, -1.0F, 1.0F));
+    store_float(
+        nr_height_offset_bits,
+        std::clamp(settings.nr_height_offset, -1.0F, 1.0F)
+    );
+    store_float(nr_source_x_bits, std::clamp(settings.nr_source_x, -2048.0F, 2048.0F));
+    store_float(nr_source_y_bits, std::clamp(settings.nr_source_y, -2048.0F, 2048.0F));
     store_float(
         nr_roundness_bits,
         std::clamp(settings.nr_roundness, 0.0F, 1.0F)
@@ -417,6 +428,7 @@ Settings settings_for_view(
     }
     if (matched_view == nullptr) {
         result.x_offset = 0.0F;
+        result.nr_x_offset = 0.0F;
         return result;
     }
 
@@ -452,11 +464,13 @@ Settings settings_for_view(
 
     if (eye_roles[0].view_id == 0U || eye_roles[1].view_id == 0U) {
         result.x_offset = 0.0F;
+        result.nr_x_offset = 0.0F;
         return result;
     }
     const bool negative = matched_view->second_eye !=
         settings.invert_stereo_x_offset;
     result.x_offset = negative ? -settings.x_offset : settings.x_offset;
+    result.nr_x_offset = negative ? -settings.nr_x_offset : settings.nr_x_offset;
     return result;
 }
 

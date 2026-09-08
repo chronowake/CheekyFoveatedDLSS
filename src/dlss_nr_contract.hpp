@@ -11,24 +11,6 @@ struct DlssNrResourceBase {
     std::uint32_t y{};
 };
 
-struct DlssNrAxis { std::uint32_t base{}, extent{}; };
-// Align the extent independently of position, then clamp the moving origin.
-[[nodiscard]] DlssNrAxis dlss_nr_aligned_axis(
-    std::uint32_t base, std::uint32_t extent, std::uint32_t capacity
-) noexcept;
-
-struct DlssNrHistory {
-    std::uint32_t x{}, y{}, width{}, height{};
-    std::uint32_t output_width{}, output_height{};
-    std::uint32_t working_width{}, working_height{};
-    float scale_x{}, scale_y{};
-};
-
-// Scales convert stored vectors to output pixels before NR working scaling.
-// Returns false when history cannot be reprojected safely.
-[[nodiscard]] bool dlss_nr_motion_offset(const DlssNrHistory& previous,
-    const DlssNrHistory& current, float& x, float& y) noexcept;
-
 // color_is_region means the texture already contains only the NR crop, whose
 // resource origin is zero. Otherwise add the eye/output base to the crop offset.
 [[nodiscard]] DlssNrResourceBase dlss_nr_resource_base(
@@ -44,6 +26,55 @@ struct DlssNrHistory {
     const FoveationGeometry* shared_sr_crop,
     std::uint32_t render_width,
     std::uint32_t render_height
+) noexcept;
+
+struct DlssNrViewCrop {
+    std::uint32_t origin_x{};
+    std::uint32_t origin_y{};
+    std::uint32_t width{};
+    std::uint32_t height{};
+};
+
+// Packed SBS/TAB keeps one-eye NGX size. Otherwise a larger color texture is
+// the displayed view, so 50% and unfoveated cover that picture, not a
+// top-left OutWidth box.
+struct DlssNrDisplayedView {
+    std::uint32_t width{};
+    std::uint32_t height{};
+    std::uint32_t travel_width{};
+    std::uint32_t travel_height{};
+};
+
+[[nodiscard]] DlssNrDisplayedView dlss_nr_displayed_view(
+    std::uint32_t view_width,
+    std::uint32_t view_height,
+    std::uint32_t travel_width = 0U,
+    std::uint32_t travel_height = 0U
+) noexcept;
+
+// Gaze u/v is 0-1 in that eye's displayed view. Adds a span-normalized offset
+// on top of the origin sliders so those sliders stay a bias / fallback.
+void apply_nr_gaze_uv(
+    Settings& settings,
+    float gaze_u,
+    float gaze_v,
+    std::uint32_t view_width,
+    std::uint32_t view_height,
+    std::uint32_t travel_width = 0U,
+    std::uint32_t travel_height = 0U
+) noexcept;
+
+[[nodiscard]] DlssNrViewCrop calculate_dlss_nr_view_crop(
+    const Settings& settings,
+    std::uint32_t view_width,
+    std::uint32_t view_height,
+    const FoveationGeometry* shared_sr_crop,
+    std::uint32_t render_width,
+    std::uint32_t render_height,
+    std::uint32_t travel_width = 0U,
+    std::uint32_t travel_height = 0U,
+    std::uint32_t eye_base_x = 0U,
+    std::uint32_t eye_base_y = 0U
 ) noexcept;
 
 }  // namespace cheeky::foveated_dlss

@@ -1,8 +1,8 @@
 #include "gaze_foveation.hpp"
 
 #include "cheeky_gaze_abi.h"
+#include "dlss_nr_contract.hpp"
 #include "runtime.hpp"
-#include "openvr_gaze.hpp"
 
 #include <Windows.h>
 
@@ -32,6 +32,9 @@ struct ViewState {
     bool logged_mapping_ready{};
     std::uint64_t last_mapping_log_qpc{};
     CropGeometry last_crop{};
+    bool last_using_gaze{};
+    float last_center_u{0.5F};
+    float last_center_v{0.5F};
 };
 
 std::mutex coordinator_mutex;
@@ -239,8 +242,7 @@ bool calculate_coordinated_crop(
         unsigned source{};
         if (automatic && xr_view && (xr_view->flags & CHEEKY_GAZE_VIEW_FORWARD_VALID) != 0U &&
             std::isfinite(xr_view->forward_u) && std::isfinite(xr_view->forward_v)) {
-            u = xr_view->forward_u; v = xr_view->forward_v;
-            source = (diagnostics.status_flags & CHEEKY_GAZE_STATUS_OPENVR) != 0U ? 3U : 2U;
+            u = xr_view->forward_u; v = xr_view->forward_v; source = 2U;
         } else if (automatic && has_multiple_stereo_views() && output_origin_x == 0U && output_origin_y == 0U &&
             projection_forward_center(camera, u, v)) {
             source = 1U;
@@ -270,8 +272,10 @@ bool calculate_coordinated_crop(
                 center, render_width, render_height, output_width, output_height,
                 output_origin_x, output_origin_y, crop);
         diagnostics.using_gaze = false;
+        auto& gaze_state = state_for_view(view_id);
+        gaze_state.last_using_gaze = false;
         if (valid) {
-            auto& state = state_for_view(view_id);
+            auto& state = gaze_state;
             reset_history = state.has_crop &&
                 (state.last_crop.input_base_x != crop.input_base_x ||
                  state.last_crop.input_base_y != crop.input_base_y ||
@@ -289,20 +293,14 @@ bool calculate_coordinated_crop(
     }
     CheekyGazeSnapshotV1 snapshot{};
     // Callers can supply a frame snapshot; otherwise read the live layer.
-    bool loaded = supplied_snapshot
+    const bool loaded = supplied_snapshot
         ? (snapshot = *supplied_snapshot, snapshot.abi_version == CHEEKY_GAZE_ABI_VERSION &&
             snapshot.structure_size >= sizeof(snapshot))
         : load_snapshot(snapshot);
-    if (!supplied_snapshot && (!loaded || snapshot.session_generation == 0U)) {
-        if (read_openvr_gaze(settings, output_resource, snapshot)) {
-            loaded = true;
-            diagnostics.layer_present = true; // Runtime adapter present; UI labels this generically.
-            diagnostics.abi_compatible = true;
-        }
-    }
     if (!loaded) {
         if (automatic) return auto_crop(nullptr);
         diagnostics.using_gaze = false;
+        state_for_view(view_id).last_using_gaze = false;
         return calculate_crop(
             fixed_settings, render_width, render_height,
             output_width, output_height, output_origin_x, output_origin_y, crop
@@ -422,15 +420,18 @@ bool calculate_coordinated_crop(
             camera.left, camera.right, camera.up, camera.down,
             xr_projections[0].valid ? 1U : 0U, xr_projections[0].left, xr_projections[0].right, xr_projections[0].up, xr_projections[0].down,
             xr_projections[1].valid ? 1U : 0U, xr_projections[1].left, xr_projections[1].right, xr_projections[1].up, xr_projections[1].down);
-        trace_event("Gaze mapping rejected DLSS view=%llu resource=0x%llX rect=(%u,%u %ux%u) stereo_assigned=%u eye=%u flags=0x%X views=%u",
+        trace_event("Gaze mapping rejected DLSS view=%llu resource=0x%llX rect=(%u,%u %ux%u) stereo_assigned=%u eye=%u flags=0x%X views=%u gaze=%u action=%u",
             static_cast<unsigned long long>(view_id), static_cast<unsigned long long>(resource_identity),
             output_origin_x, output_origin_y, output_width, output_height,
-            eye_assignment.assigned ? 1U : 0U, eye_assignment.eye_index, snapshot.status_flags, snapshot.view_count);
+            eye_assignment.assigned ? 1U : 0U, eye_assignment.eye_index, snapshot.status_flags, snapshot.view_count,
+            (snapshot.status_flags & CHEEKY_GAZE_STATUS_GAZE_VALID) != 0U ? 1U : 0U,
+            (snapshot.status_flags & CHEEKY_GAZE_STATUS_ACTION_ACTIVE) != 0U ? 1U : 0U);
         for (unsigned i = 0; i < (std::min)(snapshot.view_count, CHEEKY_GAZE_MAX_VIEWS); ++i) {
             const auto& v = snapshot.views[i];
-            trace_event("Gaze mapping XR eye=%u resource=0x%llX swapchain=0x%llX rect=(%d,%d %ux%u) array=%u flags=0x%X",
+            trace_event("Gaze mapping XR eye=%u resource=0x%llX swapchain=0x%llX rect=(%d,%d %ux%u) array=%u flags=0x%X uv=(%.3f,%.3f)",
                 i, static_cast<unsigned long long>(v.resource_identity), static_cast<unsigned long long>(v.swapchain_identity),
-                v.image_rect_x, v.image_rect_y, v.image_rect_width, v.image_rect_height, v.array_index, v.flags);
+                v.image_rect_x, v.image_rect_y, v.image_rect_width, v.image_rect_height, v.array_index, v.flags,
+                v.center_u, v.center_v);
         }
         // One bounded graph dump per view after VR has settled. This captures
         // intermediate resources as well as the two endpoints; a total-copy
@@ -475,19 +476,19 @@ bool calculate_coordinated_crop(
     );
     if (mapping_result.invalidated) {
         trace_event(
-            "VR gaze mapping invalidated view=%llu",
+            "OpenXR gaze mapping invalidated view=%llu",
             static_cast<unsigned long long>(view_id)
         );
     } else if (mapping_result.changed) {
         trace_event(
-            "VR gaze mapping changed view=%llu eye=%u generation=%llu",
+            "OpenXR gaze mapping changed view=%llu eye=%u generation=%llu",
             static_cast<unsigned long long>(view_id),
             state.mapping.view_index,
             static_cast<unsigned long long>(state.mapping.generation)
         );
     } else if (mapping_result.stable && !mapping_was_stable) {
         trace_event(
-            "VR gaze mapping established view=%llu eye=%u route=%s",
+            "OpenXR gaze mapping established view=%llu eye=%u route=%s",
             static_cast<unsigned long long>(view_id),
             state.mapping.view_index,
             projection_match ? "camera-projection" : copy_match ? "submitted-copy" : packed_stereo_match ? "packed-stereo" : "exact-resource"
@@ -538,12 +539,15 @@ bool calculate_coordinated_crop(
     const bool source_matches =
         ((snapshot.status_flags & CHEEKY_GAZE_STATUS_SIMULATED) != 0U) ==
         (settings.center_mode == FoveationCenterMode::simulated_gaze);
-    const bool snapshot_valid = source_matches &&
+    const bool gaze_fresh = source_matches &&
         (snapshot.status_flags & CHEEKY_GAZE_STATUS_GAZE_VALID) != 0U &&
-        (snapshot.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U &&
         (snapshot.status_flags & CHEEKY_GAZE_STATUS_SESSION_FOCUSED) != 0U &&
         sample_age_seconds <= gaze_stale_seconds;
+    const bool snapshot_valid = gaze_fresh &&
+        (snapshot.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U;
     const bool use_sample = mapping_stable && snapshot_valid;
+    const bool unmapped_gaze = gaze_fresh && !mapping_stable &&
+        (eye_assignment.assigned || !has_multiple_stereo_views());
     if (use_sample && settings.show_next_jump_target &&
         settings.center_mode == FoveationCenterMode::simulated_gaze &&
         (settings.simulation_pattern == 2U || settings.simulation_pattern == 3U)) {
@@ -565,6 +569,16 @@ bool calculate_coordinated_crop(
         const auto& source = snapshot.views[state.mapping.view_index];
         raw_u = source.center_u;
         raw_v = source.center_v;
+    } else if (unmapped_gaze) {
+        if (eye_assignment.assigned &&
+            eye_assignment.eye_index < snapshot.view_count) {
+            const auto& source = snapshot.views[eye_assignment.eye_index];
+            raw_u = source.center_u;
+            raw_v = source.center_v;
+        } else {
+            raw_u = 0.5F * (snapshot.views[0].center_u + snapshot.views[1].center_u);
+            raw_v = 0.5F * (snapshot.views[0].center_v + snapshot.views[1].center_v);
+        }
     }
     const auto temporal_result = update_gaze_temporal_policy(
         state.temporal,
@@ -578,10 +592,13 @@ bool calculate_coordinated_crop(
             settings.gaze_smoothing_ms,
             gaze_hold_seconds,
             gaze_return_seconds,
-            use_sample,
+            use_sample || unmapped_gaze,
         }
     );
     diagnostics.using_gaze = temporal_result.using_gaze;
+    state.last_using_gaze = temporal_result.using_gaze;
+    state.last_center_u = temporal_result.center_u;
+    state.last_center_v = temporal_result.center_v;
     if (!state.temporal.has_filtered) {
         return auto_crop(usable ? &snapshot.views[state.mapping.view_index] : nullptr);
     }
@@ -614,7 +631,7 @@ bool calculate_coordinated_crop(
             crop.input_height,
             true,
         },
-        use_sample,
+        use_sample || unmapped_gaze,
         temporal_result.reacquired,
         mapping_result.changed,
         settings.gaze_jump_reset_ratio
@@ -623,7 +640,7 @@ bool calculate_coordinated_crop(
     if (reset_history) {
         diagnostics.last_reset_reason = reset_result.reason;
         trace_event(
-            "VR gaze history reset view=%llu reason=%u",
+            "OpenXR gaze history reset view=%llu reason=%u",
             static_cast<unsigned long long>(view_id),
             static_cast<unsigned int>(reset_result.reason)
         );
@@ -721,6 +738,65 @@ void forget_gaze_resource(std::uint64_t resource) noexcept {
     std::erase_if(pending_copies, [=](const auto& p) {
         return p.edge.source.resource == resource || p.edge.destination.resource == resource;
     });
+}
+
+void apply_openxr_gaze_to_nr_settings(
+    Settings& settings,
+    const DlssViewId view_id,
+    IUnknown* const output_resource,
+    const std::uint32_t output_origin_x,
+    const std::uint32_t output_origin_y,
+    const std::uint32_t view_width,
+    const std::uint32_t view_height,
+    const std::uint32_t travel_width,
+    const std::uint32_t travel_height,
+    const bool refresh_sample
+) noexcept {
+    if (!settings.nr_foveated) return;
+    if (settings.center_mode != FoveationCenterMode::openxr_gaze &&
+        settings.center_mode != FoveationCenterMode::simulated_gaze) {
+        return;
+    }
+    if (refresh_sample && view_width != 0U && view_height != 0U) {
+        CropGeometry crop{};
+        bool reset_history{};
+        static_cast<void>(calculate_coordinated_crop(
+            settings,
+            view_id,
+            output_resource,
+            view_width,
+            view_height,
+            view_width,
+            view_height,
+            output_origin_x,
+            output_origin_y,
+            crop,
+            reset_history
+        ));
+    }
+    float gaze_u = 0.5F;
+    float gaze_v = 0.5F;
+    bool using_gaze{};
+    {
+        std::lock_guard lock(coordinator_mutex);
+        for (const auto& state : view_states) {
+            if (state.view_id != view_id) continue;
+            using_gaze = state.last_using_gaze;
+            gaze_u = state.last_center_u;
+            gaze_v = state.last_center_v;
+            break;
+        }
+    }
+    if (!using_gaze) return;
+    apply_nr_gaze_uv(
+        settings,
+        gaze_u,
+        gaze_v,
+        view_width,
+        view_height,
+        travel_width,
+        travel_height
+    );
 }
 
 }  // namespace cheeky::foveated_dlss

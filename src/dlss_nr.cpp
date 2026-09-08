@@ -2,7 +2,7 @@
 
 #include "d3d12_output_contract.hpp"
 #include "dlss_nr_contract.hpp"
-#include "crop_motion.hpp"
+#include "gaze_foveation.hpp"
 #include "runtime.hpp"
 
 #include <Windows.h>
@@ -69,12 +69,15 @@ struct RuntimeState {
     std::uint32_t state{};
 };
 
+std::atomic<bool> host_evaluate_succeeded{};
+std::atomic<bool> runtime_load_started{};
+ID3D12Device* pending_device{};
+
 struct FeatureKey {
     std::uint32_t input_width{};
     std::uint32_t input_height{};
     std::uint32_t output_width{};
     std::uint32_t output_height{};
-    std::uint32_t create_flags{};
 };
 
 struct NrRegion {
@@ -127,10 +130,11 @@ struct ViewState {
     bool was_enabled{};
     std::uint64_t settings_signature{};
     std::uint64_t reset_generation{};
-    DlssNrHistory history{};
-    DlssNrRoute history_route{};
-    std::uint64_t history_calls{}, history_moves{}, history_resets{};
-    std::uint64_t history_corrections{}, history_compensation_failures{};
+    std::uint32_t logged_crop_x{};
+    std::uint32_t logged_crop_y{};
+    std::uint32_t logged_crop_w{};
+    std::uint32_t logged_crop_h{};
+    bool logged_crop{};
     std::deque<CachedFeature> retired_features;
     std::deque<GpuResources> gpu_resources;
 };
@@ -308,10 +312,11 @@ DWORD WINAPI hook_nr_get_module_file_name(
     return false;
 }
 
-[[nodiscard]] bool initialize_runtime(ID3D12Device* const device) noexcept {
-    if (runtime.state == 1U) return runtime.device == device;
-    if (runtime.state == 2U || runtime.state == 3U || device == nullptr) {
-        return false;
+[[nodiscard]] bool load_nr_module() noexcept {
+    if (runtime.module != nullptr) return true;
+    if (runtime.state == 2U || runtime.state == 3U) return false;
+    if (runtime_load_started.exchange(true, std::memory_order_acq_rel)) {
+        return runtime.module != nullptr;
     }
 
     std::array<wchar_t, 32768U> directory{};
@@ -330,6 +335,7 @@ DWORD WINAPI hook_nr_get_module_file_name(
         return false;
     }
     std::memcpy(path.data() + used, filename, sizeof(filename));
+    trace_event("DLSS-NR loading nvngx_dlssnr.dll off the NGX evaluate thread");
     runtime.module = LoadLibraryExW(
         path.data(),
         nullptr,
@@ -346,6 +352,18 @@ DWORD WINAPI hook_nr_get_module_file_name(
         );
         return false;
     }
+    return true;
+}
+
+[[nodiscard]] bool initialize_runtime(ID3D12Device* const device) noexcept {
+    if (!host_evaluate_succeeded.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (runtime.state == 1U) return runtime.device == device;
+    if (runtime.state == 2U || runtime.state == 3U || device == nullptr) {
+        return false;
+    }
+    if (!load_nr_module() || runtime.module == nullptr) return false;
 
     void* original_get_module_file_name{};
     if (!patch_named_import(
@@ -408,6 +426,12 @@ DWORD WINAPI hook_nr_get_module_file_name(
         return false;
     }
 
+    std::array<wchar_t, 32768U> directory{};
+    if (!addon_directory(directory)) {
+        runtime.state = 3U;
+        diagnostics.state = DlssNrState::runtime_failed;
+        return false;
+    }
     constexpr unsigned long long application_id = 0x0876232cULL;
     constexpr std::uint32_t ngx_sdk_version = 0x15U;
     const auto result = initialize(
@@ -435,9 +459,9 @@ DWORD WINAPI hook_nr_get_module_file_name(
 
 NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcept {
     if (parameters == nullptr) return 0xBAD00005U;
-    float scale{1.0F};
-    if (!ngx_succeeded(parameters->Get("DLSSNR.Scale", &scale))) scale = 1.0F;
-    parameters->Set("DLSSNR.ScalingRatio", std::clamp(scale, 0.1F, 1.0F));
+    parameters->Set("DLSSNR.ScalingRatio", 1.0F);
+    parameters->Set("DLSSNR.Scale", 1.0F);
+    parameters->Set("DLSSNR.Upscaling", 0U);
     return 1U;
 }
 
@@ -462,7 +486,6 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
         working_height,
         working_width,
         working_height,
-        frame.create_flags,
     };
     if (view.handle != nullptr && view.has_key && view.key == key) return true;
     if (view.feature_failed && view.has_key && view.key == key) return false;
@@ -1065,36 +1088,65 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
     const std::uint32_t height,
     const FoveationGeometry* const shared_sr_crop,
     const std::uint32_t render_width,
-    const std::uint32_t render_height
+    const std::uint32_t render_height,
+    const std::uint32_t travel_width = 0U,
+    const std::uint32_t travel_height = 0U,
+    const std::uint32_t eye_base_x = 0U,
+    const std::uint32_t eye_base_y = 0U
 ) noexcept {
     if (!settings.nr_foveated) {
-        return {0U, 0U, width, height, 1.0F, 1.0F, 0.0F, 0.0F};
+        Settings full_view = settings;
+        full_view.nr_width = 1.0F;
+        full_view.nr_height = 1.0F;
+        full_view.nr_center_x = 0.0F;
+        full_view.nr_x_offset = 0.0F;
+        full_view.nr_height_offset = 0.0F;
+        full_view.nr_source_x = 0.0F;
+        full_view.nr_source_y = 0.0F;
+        full_view.nr_use_sr_foveation = false;
+        const auto crop = calculate_dlss_nr_view_crop(
+            full_view,
+            width,
+            height,
+            nullptr,
+            0U,
+            0U,
+            travel_width,
+            travel_height,
+            eye_base_x,
+            eye_base_y
+        );
+        return {
+            crop.origin_x,
+            crop.origin_y,
+            crop.width,
+            crop.height,
+            1.0F,
+            1.0F,
+            0.0F,
+            0.0F,
+        };
     }
+    const auto crop = calculate_dlss_nr_view_crop(
+        settings,
+        width,
+        height,
+        shared_sr_crop,
+        render_width,
+        render_height,
+        travel_width,
+        travel_height,
+        eye_base_x,
+        eye_base_y
+    );
     const auto parameters = dlss_nr_foveation_parameters(
         settings, shared_sr_crop, render_width, render_height
     );
-    FoveationGeometry geometry{};
-    if (!calculate_foveation_geometry(
-            parameters,
-            width,
-            height,
-            width,
-            height,
-            0U,
-            0U,
-            geometry
-        )) {
-        return {0U, 0U, width, height, 1.0F, 1.0F, 0.0F, 0.0F};
-    }
-    const auto x = dlss_nr_aligned_axis(
-        geometry.output_base_x, geometry.output_width, width);
-    const auto y = dlss_nr_aligned_axis(
-        geometry.output_base_y, geometry.output_height, height);
     return {
-        x.base,
-        y.base,
-        x.extent,
-        y.extent,
+        crop.origin_x,
+        crop.origin_y,
+        crop.width,
+        crop.height,
         parameters.width,
         parameters.height,
         parameters.roundness,
@@ -1173,6 +1225,8 @@ struct ScaledSubrect {
     append(settings.nr_automatic_mask ? 1U : 0U);
     append(settings.nr_ui_correction ? 1U : 0U);
     append(settings.nr_depth_convention);
+    append(region.base_x);
+    append(region.base_y);
     append(region.width);
     append(region.height);
     return signature;
@@ -1192,6 +1246,80 @@ void transition(
     barrier.Transition.StateAfter = after;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     command_list->ResourceBarrier(1U, &barrier);
+}
+
+void restore_original_color(
+    const DlssNrFrame& frame,
+    GpuResources& gpu,
+    const NrRegion& codec_region
+) noexcept {
+    const auto original_format = gpu.original_output->GetDesc().Format;
+    const auto presented_format = frame.color->GetDesc().Format;
+    if (original_format != presented_format) {
+        transition(
+            frame.command_list,
+            gpu.original_output,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        );
+        transition(
+            frame.command_list,
+            gpu.color_proxy,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        );
+        transition(
+            frame.command_list,
+            frame.color,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            frame.color_state
+        );
+        return;
+    }
+    transition(
+        frame.command_list,
+        gpu.original_output,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_COPY_SOURCE
+    );
+    transition(
+        frame.command_list,
+        frame.color,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST
+    );
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = gpu.original_output;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = frame.color;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    frame.command_list->CopyTextureRegion(
+        &destination,
+        codec_region.base_x,
+        codec_region.base_y,
+        0U,
+        &source,
+        nullptr
+    );
+    transition(
+        frame.command_list,
+        gpu.original_output,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    );
+    transition(
+        frame.command_list,
+        gpu.color_proxy,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    );
+    transition(
+        frame.command_list,
+        frame.color,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        frame.color_state
+    );
 }
 
 void uav_barrier(
@@ -1276,11 +1404,14 @@ bool calculate_dlss_nr_geometry(
     const Settings& settings,
     const std::uint32_t output_width,
     const std::uint32_t output_height,
-    DlssNrGeometry& geometry
+    DlssNrGeometry& geometry,
+    const std::uint32_t travel_width,
+    const std::uint32_t travel_height
 ) noexcept {
     if (output_width == 0U || output_height == 0U) return false;
     const auto region = calculate_region(
-        settings, output_width, output_height, nullptr, 0U, 0U
+        settings, output_width, output_height, nullptr, 0U, 0U,
+        travel_width, travel_height
     );
     if (region.width == 0U || region.height == 0U) return false;
     geometry = {
@@ -1294,11 +1425,63 @@ bool calculate_dlss_nr_geometry(
     return true;
 }
 
+void note_dlss_nr_host_evaluate_succeeded() noexcept {
+    host_evaluate_succeeded.store(true, std::memory_order_release);
+}
+
+void note_dlss_nr_host_device(ID3D12Device* const device) noexcept {
+    if (device == nullptr) return;
+    std::lock_guard lock(nr_mutex);
+    if (pending_device == device) return;
+    if (pending_device != nullptr) pending_device->Release();
+    pending_device = device;
+    pending_device->AddRef();
+}
+
+void pump_dlss_nr_runtime() noexcept {
+    if (!host_evaluate_succeeded.load(std::memory_order_acquire)) return;
+    if (!load_nr_module()) return;
+    std::lock_guard lock(nr_mutex);
+    if (runtime.state == 1U || runtime.state == 2U || runtime.state == 3U) {
+        return;
+    }
+    auto* const device = pending_device;
+    if (device == nullptr) return;
+    static_cast<void>(initialize_runtime(device));
+}
+
 bool evaluate_dlss_nr(
     const DlssNrFrame& frame,
     const Settings& settings
 ) noexcept {
-    std::lock_guard lock(nr_mutex);
+    Settings nr_settings = settings;
+    const auto eye_base_x = frame.color_is_region ? 0U : frame.color_base_x;
+    const auto eye_base_y = frame.color_is_region ? 0U : frame.color_base_y;
+    std::uint32_t travel_width = frame.output_width;
+    std::uint32_t travel_height = frame.output_height;
+    if (frame.color != nullptr) {
+        const auto color_desc = frame.color->GetDesc();
+        travel_width = (std::max)(
+            frame.output_width, static_cast<std::uint32_t>(color_desc.Width)
+        );
+        travel_height = (std::max)(
+            frame.output_height, static_cast<std::uint32_t>(color_desc.Height)
+        );
+        apply_openxr_gaze_to_nr_settings(
+            nr_settings,
+            frame.view_id,
+            frame.color,
+            eye_base_x,
+            eye_base_y,
+            frame.output_width,
+            frame.output_height,
+            travel_width,
+            travel_height,
+            true
+        );
+    }
+    std::unique_lock lock(nr_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
     diagnostics.route = frame.route;
     if (!settings.nr_enabled) {
         diagnostics.state = DlssNrState::disabled;
@@ -1306,13 +1489,6 @@ bool evaluate_dlss_nr(
         return false;
     }
     ++diagnostics.candidate_calls;
-    auto& view = find_or_create_view(frame.view_id);
-    // Any rejected/failed NR evaluation breaks consecutive temporal history.
-    struct HistoryGuard {
-        ViewState& view;
-        bool succeeded{};
-        ~HistoryGuard() { if (!succeeded) view.was_enabled = false; }
-    } history_guard{view};
     if (frame.command_list == nullptr || frame.view_id == 0U ||
         frame.color == nullptr || frame.depth == nullptr ||
         frame.motion_vectors == nullptr || frame.input_width == 0U ||
@@ -1332,31 +1508,93 @@ bool evaluate_dlss_nr(
         ++diagnostics.failed_calls;
         return false;
     }
-    const bool runtime_ready = initialize_runtime(device);
+    const bool runtime_ready = runtime.state == 1U && runtime.device == device;
+    if (!runtime_ready) {
+        if (pending_device != device) {
+            if (pending_device != nullptr) pending_device->Release();
+            pending_device = device;
+            pending_device->AddRef();
+        }
+        device->Release();
+        return false;
+    }
     device->Release();
-    if (!runtime_ready) return false;
 
-    const auto region = calculate_region(
-        settings,
+    const auto color_desc = frame.color->GetDesc();
+    auto region = calculate_region(
+        nr_settings,
         frame.output_width,
         frame.output_height,
         frame.has_shared_sr_crop ? &frame.shared_sr_crop : nullptr,
         frame.input_width,
-        frame.input_height
+        frame.input_height,
+        travel_width,
+        travel_height,
+        eye_base_x,
+        eye_base_y
     );
-    const auto working_width = scaled_extent(region.width, settings.nr_working_scale);
-    const auto working_height = scaled_extent(region.height, settings.nr_working_scale);
+    auto& view = find_or_create_view(frame.view_id);
+    const auto stabilize = [](
+        const std::uint32_t requested,
+        const std::uint32_t previous,
+        const bool has_previous
+    ) noexcept {
+        if (!has_previous || previous < 8U) return requested;
+        const auto delta = requested > previous
+            ? requested - previous : previous - requested;
+        return delta <= 1U ? previous : requested;
+    };
+    region.width = stabilize(region.width, view.key.input_width, view.has_key);
+    region.height = stabilize(
+        region.height, view.key.input_height, view.has_key
+    );
+    if (region.base_x + region.width > travel_width) {
+        region.base_x = travel_width > region.width
+            ? (travel_width - region.width) / 8U * 8U : 0U;
+        if (region.base_x + region.width > travel_width) {
+            region.width = travel_width / 8U * 8U;
+        }
+    }
+    if (region.base_y + region.height > travel_height) {
+        region.base_y = travel_height > region.height
+            ? (travel_height - region.height) / 8U * 8U : 0U;
+        if (region.base_y + region.height > travel_height) {
+            region.height = travel_height / 8U * 8U;
+        }
+    }
+    if (!view.logged_crop ||
+        view.logged_crop_x != region.base_x ||
+        view.logged_crop_y != region.base_y ||
+        view.logged_crop_w != region.width ||
+        view.logged_crop_h != region.height) {
+        view.logged_crop = true;
+        view.logged_crop_x = region.base_x;
+        view.logged_crop_y = region.base_y;
+        view.logged_crop_w = region.width;
+        view.logged_crop_h = region.height;
+        const auto displayed = dlss_nr_displayed_view(
+            frame.output_width,
+            frame.output_height,
+            travel_width,
+            travel_height
+        );
+        trace_event(
+            "NR crop view=%llu origin=%u,%u size=%ux%u of %ux%u stereoX=%.3f source=%.0f,%.0f",
+            static_cast<unsigned long long>(frame.view_id),
+            region.base_x,
+            region.base_y,
+            region.width,
+            region.height,
+            displayed.width,
+            displayed.height,
+            settings.nr_x_offset,
+            settings.nr_source_x,
+            settings.nr_source_y
+        );
+    }
+    const auto working_width = scaled_extent(region.width, nr_settings.nr_working_scale);
+    const auto working_height = scaled_extent(region.height, nr_settings.nr_working_scale);
     NrRegion codec_region = region;
-    const auto resource_base = dlss_nr_resource_base(
-        region.base_x,
-        region.base_y,
-        frame.color_base_x,
-        frame.color_base_y,
-        frame.color_is_region
-    );
-    codec_region.base_x = resource_base.x;
-    codec_region.base_y = resource_base.y;
-    const auto color_desc = frame.color->GetDesc();
     if (codec_region.base_x + codec_region.width > color_desc.Width ||
         codec_region.base_y + codec_region.height > color_desc.Height) {
         diagnostics.state = DlssNrState::unsupported_resources;
@@ -1374,10 +1612,12 @@ bool evaluate_dlss_nr(
         working_height
     );
     if (gpu == nullptr) return false;
+    const auto local_x = region.base_x > eye_base_x ? region.base_x - eye_base_x : 0U;
+    const auto local_y = region.base_y > eye_base_y ? region.base_y - eye_base_y : 0U;
     const auto depth_x = frame.color_is_region
         ? ScaledSubrect{frame.depth_base_x, frame.depth_width}
         : scale_subrect(
-            region.base_x,
+            local_x,
             region.width,
             frame.depth_base_x,
             frame.depth_width,
@@ -1386,7 +1626,7 @@ bool evaluate_dlss_nr(
     const auto depth_y = frame.color_is_region
         ? ScaledSubrect{frame.depth_base_y, frame.depth_height}
         : scale_subrect(
-            region.base_y,
+            local_y,
             region.height,
             frame.depth_base_y,
             frame.depth_height,
@@ -1395,7 +1635,7 @@ bool evaluate_dlss_nr(
     const auto motion_x = frame.color_is_region
         ? ScaledSubrect{frame.motion_base_x, frame.motion_width}
         : scale_subrect(
-            region.base_x,
+            local_x,
             region.width,
             frame.motion_base_x,
             frame.motion_width,
@@ -1404,7 +1644,7 @@ bool evaluate_dlss_nr(
     const auto motion_y = frame.color_is_region
         ? ScaledSubrect{frame.motion_base_y, frame.motion_height}
         : scale_subrect(
-            region.base_y,
+            local_y,
             region.height,
             frame.motion_base_y,
             frame.motion_height,
@@ -1416,87 +1656,12 @@ bool evaluate_dlss_nr(
     const auto reset_generation = requested_reset_generation.load(
         std::memory_order_acquire
     );
-    const char* reset_reason = frame.reset ? "explicit" :
-        !view.was_enabled ? "no-history" :
-        view.settings_signature != signature ? "settings" :
-        view.reset_generation != reset_generation ? "requested" :
-        view.history_route != frame.route ? "route" : nullptr;
-    bool reset = reset_reason != nullptr;
-    const DlssNrHistory history{
-        region.base_x, region.base_y, region.width, region.height,
-        frame.output_width, frame.output_height, working_width, working_height,
-        frame.motion_scale_x * settings.nr_motion_scale_x_multiplier,
-        frame.motion_scale_y * settings.nr_motion_scale_y_multiplier,
-    };
-    auto* motion_vectors = frame.motion_vectors;
-    auto motion_base_x = motion_x.base;
-    auto motion_base_y = motion_y.base;
-    CropMotionOffset offset{};
-    if (!reset) {
-        reset = !dlss_nr_motion_offset(view.history, history, offset.x, offset.y);
-        if (reset) reset_reason = "incompatible-geometry-or-scale";
-        if (!reset && (offset.x != 0.0F || offset.y != 0.0F)) {
-            // Working scaling multiplies both the origin displacement and MV
-            // scale, so it cancels when computing the stored-vector offset.
-            auto* corrected = !frame.motion_vectors_3d &&
-                frame.motion_state != static_cast<D3D12_RESOURCE_STATES>(0xFFFFFFFFU)
-                ? prepare_crop_motion12(frame.command_list, frame.motion_vectors,
-                    motion_x.base, motion_y.base, motion_x.extent, motion_y.extent,
-                    offset, frame.motion_state) : nullptr;
-            if (corrected) {
-                motion_vectors = corrected;
-                motion_base_x = motion_base_y = 0U;
-            } else {
-                reset = true;
-                reset_reason = "compensation-unavailable";
-            }
-        }
-    }
-    const bool moved = view.was_enabled &&
-        (view.history.x != history.x || view.history.y != history.y);
-    ++view.history_calls;
-    if (moved) ++view.history_moves;
-    if (reset) ++view.history_resets;
-    if (motion_vectors != frame.motion_vectors) ++view.history_corrections;
-    const bool compensation_failed = reset_reason != nullptr &&
-        std::strcmp(reset_reason, "compensation-unavailable") == 0;
-    if (compensation_failed) ++view.history_compensation_failures;
-    // Budget startup and moving-frame samples separately for each eye. A
-    // desktop/menu view must not consume all diagnostics before VR starts.
-    if (view.history_calls <= 8U || (moved && view.history_moves <= 16U) ||
-        (compensation_failed && view.history_compensation_failures <= 8U) ||
-        view.history_calls % 300U == 0U) {
-        const auto motion_desc = frame.motion_vectors->GetDesc();
-        trace_event("DLSS-NR history view=%llu region=%ux%u@%u,%u "
-            "previous=%u,%u working=%ux%u offset=%.6f,%.6f corrected=%s reset=%s reason=%s "
-            "calls=%llu moves=%llu resets=%llu corrections=%llu compensationFailures=%llu",
-            static_cast<unsigned long long>(frame.view_id), region.width, region.height,
-            region.base_x, region.base_y, view.history.x, view.history.y,
-            working_width, working_height, offset.x, offset.y,
-            motion_vectors != frame.motion_vectors ? "yes" : "no", reset ? "yes" : "no",
-            reset_reason != nullptr ? reset_reason : "none",
-            static_cast<unsigned long long>(view.history_calls),
-            static_cast<unsigned long long>(view.history_moves),
-            static_cast<unsigned long long>(view.history_resets),
-            static_cast<unsigned long long>(view.history_corrections),
-            static_cast<unsigned long long>(view.history_compensation_failures));
-        trace_event("DLSS-NR inputs view=%llu flags=0x%X output=%ux%u@%u,%u "
-            "mvTexture=%llux%u format=%u state=0x%X mvRect=%ux%u@%u,%u "
-            "mvScale=%.6f,%.6f nrScale=%.6f,%.6f depthRect=%ux%u@%u,%u "
-            "sharedSR=%s srCrop=%ux%u@%u,%u",
-            static_cast<unsigned long long>(frame.view_id), frame.create_flags,
-            frame.output_width, frame.output_height, frame.color_base_x, frame.color_base_y,
-            static_cast<unsigned long long>(motion_desc.Width), motion_desc.Height,
-            static_cast<unsigned>(motion_desc.Format), static_cast<unsigned>(frame.motion_state),
-            motion_x.extent, motion_y.extent, motion_x.base, motion_y.base,
-            frame.motion_scale_x, frame.motion_scale_y,
-            history.scale_x * working_width / region.width,
-            history.scale_y * working_height / region.height,
-            depth_x.extent, depth_y.extent, depth_x.base, depth_y.base,
-            frame.has_shared_sr_crop ? "yes" : "no",
-            frame.shared_sr_crop.output_width, frame.shared_sr_crop.output_height,
-            frame.shared_sr_crop.output_base_x, frame.shared_sr_crop.output_base_y);
-    }
+    const bool reset = frame.reset || !view.was_enabled ||
+        view.settings_signature != signature ||
+        view.reset_generation != reset_generation;
+    view.was_enabled = true;
+    view.settings_signature = signature;
+    view.reset_generation = reset_generation;
 
     uav_barrier(frame.command_list, frame.color);
     transition(
@@ -1531,7 +1696,7 @@ bool evaluate_dlss_nr(
 
     parameters->Set("DLSSNR.Color", gpu->color_proxy);
     parameters->Set("DLSSNR.Output", gpu->neural_output);
-    parameters->Set("DLSSNR.MVec", motion_vectors);
+    parameters->Set("DLSSNR.MVec", frame.motion_vectors);
     parameters->Set("DLSSNR.Depth", frame.depth);
     parameters->Set("DLSSNR.ColorSubrectBaseX", 0U);
     parameters->Set("DLSSNR.ColorSubrectBaseY", 0U);
@@ -1545,8 +1710,8 @@ bool evaluate_dlss_nr(
     parameters->Set("DLSSNR.DepthSubrectBaseY", depth_y.base);
     parameters->Set("DLSSNR.DepthSubrectWidth", depth_x.extent);
     parameters->Set("DLSSNR.DepthSubrectHeight", depth_y.extent);
-    parameters->Set("DLSSNR.MVecSubrectBaseX", motion_base_x);
-    parameters->Set("DLSSNR.MVecSubrectBaseY", motion_base_y);
+    parameters->Set("DLSSNR.MVecSubrectBaseX", motion_x.base);
+    parameters->Set("DLSSNR.MVecSubrectBaseY", motion_y.base);
     parameters->Set("DLSSNR.MVecSubrectWidth", motion_x.extent);
     parameters->Set("DLSSNR.MVecSubrectHeight", motion_y.extent);
     parameters->Set(
@@ -1591,6 +1756,16 @@ bool evaluate_dlss_nr(
     diagnostics.last_result = result;
     diagnostics.output_width = frame.output_width;
     diagnostics.output_height = frame.output_height;
+    diagnostics.color_width = static_cast<std::uint32_t>(color_desc.Width);
+    diagnostics.color_height = static_cast<std::uint32_t>(color_desc.Height);
+    const auto displayed_view = dlss_nr_displayed_view(
+        frame.output_width,
+        frame.output_height,
+        travel_width,
+        travel_height
+    );
+    diagnostics.view_width = displayed_view.width;
+    diagnostics.view_height = displayed_view.height;
     diagnostics.region_base_x = region.base_x;
     diagnostics.region_base_y = region.base_y;
     diagnostics.region_width = region.width;
@@ -1601,24 +1776,7 @@ bool evaluate_dlss_nr(
         static_cast<std::uint64_t>(region.width) * region.height * 8U +
         static_cast<std::uint64_t>(working_width) * working_height * 16U;
     if (!ngx_succeeded(result)) {
-        transition(
-            frame.command_list,
-            gpu->original_output,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-        );
-        transition(
-            frame.command_list,
-            gpu->color_proxy,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-        );
-        transition(
-            frame.command_list,
-            frame.color,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            frame.color_state
-        );
+        restore_original_color(frame, *gpu, codec_region);
         diagnostics.state = DlssNrState::evaluation_failed;
         ++diagnostics.failed_calls;
         trace_event(
@@ -1676,12 +1834,6 @@ bool evaluate_dlss_nr(
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS
     );
     ++diagnostics.evaluation_calls;
-    view.history = history;
-    view.history_route = frame.route;
-    view.settings_signature = signature;
-    view.reset_generation = reset_generation;
-    view.was_enabled = true;
-    history_guard.succeeded = true;
     diagnostics.state = DlssNrState::active;
     if (diagnostics.evaluation_calls == 1U ||
         diagnostics.evaluation_calls % 300U == 0U) {
@@ -1721,6 +1873,8 @@ void release_dlss_nr_resources() noexcept {
     }
     views.clear();
     release(runtime.device);
+    release(pending_device);
+    runtime_load_started.store(false, std::memory_order_release);
     // Keep the signed module loaded: its shutdown export is not part of the
     // known-good feature-18 contract and unloading it can race queued work.
     runtime = {};

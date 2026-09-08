@@ -1,6 +1,7 @@
 #include "d3d11_d3d12_transport.hpp"
 
 #include "diagnostics.hpp"
+#include "dlss_nr.hpp"
 #include "peripheral_dlaa.hpp"
 #include "gaze_foveation.hpp"
 #include "runtime.hpp"
@@ -14,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -97,12 +99,23 @@ struct ScaledRange {
     std::uint32_t extent{};
 };
 
+[[nodiscard]] std::uint32_t align8_down(const std::uint32_t value) noexcept {
+    return value / 8U * 8U;
+}
+
+[[nodiscard]] std::uint32_t align8_up(const std::uint32_t value) noexcept {
+    return (value + 7U) / 8U * 8U;
+}
+
 [[nodiscard]] ScaledRange scale_range(
     const std::uint32_t base,
     const std::uint32_t extent,
     const std::uint32_t source_extent,
     const std::uint32_t output_extent
 ) noexcept {
+    if (source_extent == 0U || output_extent == 0U || extent == 0U) {
+        return {};
+    }
     const auto scaled_base = static_cast<std::uint32_t>(
         static_cast<std::uint64_t>(base) * source_extent / output_extent
     );
@@ -111,7 +124,19 @@ struct ScaledRange {
         (static_cast<std::uint64_t>(base + extent) * source_extent +
             output_extent - 1U) / output_extent
     ));
-    return {scaled_base, (std::max)(1U, scaled_end - scaled_base)};
+    auto aligned_base = align8_down(scaled_base);
+    auto aligned_extent = align8_up((std::max)(1U, scaled_end - scaled_base));
+    if (aligned_extent < 8U) aligned_extent = 8U;
+    if (aligned_base + aligned_extent > source_extent) {
+        if (source_extent >= aligned_extent) {
+            aligned_base = align8_down(source_extent - aligned_extent);
+        } else {
+            aligned_base = 0U;
+            aligned_extent = align8_down(source_extent);
+        }
+    }
+    if (aligned_extent == 0U) return {};
+    return {aligned_base, aligned_extent};
 }
 
 struct InitContract {
@@ -194,6 +219,10 @@ struct TransportDevice {
     ID3D12Fence* fence12{};
     ID3D11ComputeShader* depth_shader{};
     ID3D11Buffer* depth_constants{};
+    ID3D11Texture2D* depth_copy{};
+    DXGI_FORMAT depth_copy_format{DXGI_FORMAT_UNKNOWN};
+    std::uint32_t depth_copy_width{};
+    std::uint32_t depth_copy_height{};
     NgxParameters* ngx_parameters{};
     std::deque<TransportView> views;
     std::uint64_t next_fence_value{1U};
@@ -273,6 +302,7 @@ void release_device(TransportDevice& device) noexcept {
         device.device12 != nullptr) {
         static_cast<void>(device.shutdown(device.device12));
     }
+    release(device.depth_copy);
     release(device.depth_constants);
     release(device.depth_shader);
     release(device.fence12);
@@ -667,6 +697,7 @@ void trace_format_support(
         release_device(device);
         return false;
     }
+    note_dlss_nr_host_device(device.device12);
     return true;
 }
 
@@ -712,16 +743,21 @@ void trace_format_support(
     const std::uint32_t peripheral_motion_width,
     const std::uint32_t peripheral_motion_height,
     const bool peripheral_enabled,
+    const bool transport_sr,
     const DXGI_FORMAT color_format,
     const DXGI_FORMAT motion_format,
     const DXGI_FORMAT output_format
 ) noexcept {
-    return slot.color.resource12 != nullptr &&
-        slot.input_width == crop.input_width &&
-        slot.input_height == crop.input_height &&
-        slot.output_width == crop.output_width &&
-        slot.output_height == crop.output_height &&
-        slot.color_format == color_format &&
+    if (transport_sr) {
+        if (slot.color.resource12 == nullptr ||
+            slot.input_width != crop.input_width ||
+            slot.input_height != crop.input_height ||
+            slot.output_width != crop.output_width ||
+            slot.output_height != crop.output_height) {
+            return false;
+        }
+    }
+    return slot.color_format == color_format &&
         slot.motion_format == motion_format &&
         slot.output_format == output_format &&
         (!peripheral_enabled || (
@@ -766,6 +802,7 @@ void trace_format_support(
     const std::uint32_t peripheral_motion_width,
     const std::uint32_t peripheral_motion_height,
     const bool peripheral_enabled,
+    const bool transport_sr,
     const DXGI_FORMAT color_format,
     const DXGI_FORMAT motion_format,
     const DXGI_FORMAT output_format
@@ -844,18 +881,21 @@ void trace_format_support(
             static_cast<unsigned int>(readback_result)
         );
     }
-    if (!create_shared_texture(device, "color",
+    const bool sr_ok = !transport_sr || (
+        create_shared_texture(device, "color",
             crop.input_width, crop.input_height, color_format,
-            D3D12_RESOURCE_FLAG_NONE, slot.color) ||
-        !create_shared_texture(device, "depth",
+            D3D12_RESOURCE_FLAG_NONE, slot.color) &&
+        create_shared_texture(device, "depth",
             crop.input_width, crop.input_height, DXGI_FORMAT_R32_FLOAT,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, slot.depth) ||
-        !create_shared_texture(device, "motion vectors",
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, slot.depth) &&
+        create_shared_texture(device, "motion vectors",
             crop.output_width, crop.output_height, motion_format,
-            D3D12_RESOURCE_FLAG_NONE, slot.motion_vectors) ||
-        !create_shared_texture(device, "output",
+            D3D12_RESOURCE_FLAG_NONE, slot.motion_vectors) &&
+        create_shared_texture(device, "output",
             crop.output_width, crop.output_height, output_format,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, slot.output) ||
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, slot.output)
+    );
+    if (!sr_ok ||
         (peripheral_enabled && (
             !create_shared_texture(device, "peripheral DLAA color",
                 peripheral_render_width, peripheral_render_height, color_format,
@@ -887,10 +927,10 @@ void trace_format_support(
         release_slot(slot);
         return false;
     }
-    slot.input_width = crop.input_width;
-    slot.input_height = crop.input_height;
-    slot.output_width = crop.output_width;
-    slot.output_height = crop.output_height;
+    slot.input_width = transport_sr ? crop.input_width : 0U;
+    slot.input_height = transport_sr ? crop.input_height : 0U;
+    slot.output_width = transport_sr ? crop.output_width : 0U;
+    slot.output_height = transport_sr ? crop.output_height : 0U;
     slot.peripheral_render_width = peripheral_render_width;
     slot.peripheral_render_height = peripheral_render_height;
     slot.peripheral_output_width = peripheral_output_width;
@@ -914,14 +954,84 @@ void trace_format_support(
     switch (format) {
     case DXGI_FORMAT_R32G8X24_TYPELESS:
     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
         return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
     case DXGI_FORMAT_R32_TYPELESS:
     case DXGI_FORMAT_D32_FLOAT:
     case DXGI_FORMAT_R32_FLOAT:
         return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_D16_UNORM:
+    case DXGI_FORMAT_R16_UNORM:
+        return DXGI_FORMAT_R16_UNORM;
     default:
         return DXGI_FORMAT_UNKNOWN;
     }
+}
+
+[[nodiscard]] DXGI_FORMAT typeless_depth_copy_format(
+    const DXGI_FORMAT format
+) noexcept {
+    switch (format) {
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        return DXGI_FORMAT_R32G8X24_TYPELESS;
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT:
+    case DXGI_FORMAT_R32_FLOAT:
+        return DXGI_FORMAT_R32_TYPELESS;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        return DXGI_FORMAT_R24G8_TYPELESS;
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_D16_UNORM:
+    case DXGI_FORMAT_R16_UNORM:
+        return DXGI_FORMAT_R16_TYPELESS;
+    default:
+        return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+[[nodiscard]] bool ensure_depth_copy(
+    TransportDevice& device,
+    const DXGI_FORMAT typeless_format,
+    const std::uint32_t width,
+    const std::uint32_t height
+) noexcept {
+    if (device.depth_copy != nullptr &&
+        device.depth_copy_format == typeless_format &&
+        device.depth_copy_width == width &&
+        device.depth_copy_height == height) {
+        return true;
+    }
+    release(device.depth_copy);
+    device.depth_copy_format = DXGI_FORMAT_UNKNOWN;
+    device.depth_copy_width = 0U;
+    device.depth_copy_height = 0U;
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1U;
+    desc.ArraySize = 1U;
+    desc.Format = typeless_format;
+    desc.SampleDesc.Count = 1U;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(device.device11->CreateTexture2D(
+            &desc, nullptr, &device.depth_copy
+        ))) {
+        return false;
+    }
+    device.depth_copy_format = typeless_format;
+    device.depth_copy_width = width;
+    device.depth_copy_height = height;
+    return true;
 }
 
 [[nodiscard]] bool convert_depth_crop(
@@ -936,7 +1046,19 @@ void trace_format_support(
     SharedTexture& destination
 ) noexcept {
     const auto srv_format = depth_srv_format(source_format);
-    if (srv_format == DXGI_FORMAT_UNKNOWN) return false;
+    if (srv_format == DXGI_FORMAT_UNKNOWN) {
+        static std::atomic<std::uint64_t> unknown_format_sequence{};
+        const auto sequence = unknown_format_sequence.fetch_add(
+            1U, std::memory_order_relaxed
+        );
+        if (sequence < 8U || sequence % 300U == 0U) {
+            trace_event(
+                "DX11 transport depth format unsupported format=%u",
+                static_cast<unsigned int>(source_format)
+            );
+        }
+        return false;
+    }
     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
     srv_desc.Format = srv_format;
     srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -946,11 +1068,70 @@ void trace_format_support(
     uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
     ID3D11ShaderResourceView* srv{};
     ID3D11UnorderedAccessView* uav{};
-    if (FAILED(device.device11->CreateShaderResourceView(depth, &srv_desc, &srv)) ||
-        FAILED(device.device11->CreateUnorderedAccessView(
-            destination.texture11, &uav_desc, &uav))) {
+    std::uint32_t sample_x = source_x;
+    std::uint32_t sample_y = source_y;
+    HRESULT srv_result = device.device11->CreateShaderResourceView(
+        depth, &srv_desc, &srv
+    );
+    if (FAILED(srv_result)) {
+        const auto copy_format = typeless_depth_copy_format(source_format);
+        if (copy_format == DXGI_FORMAT_UNKNOWN ||
+            !ensure_depth_copy(device, copy_format, width, height)) {
+            static std::atomic<std::uint64_t> srv_failure_sequence{};
+            const auto sequence = srv_failure_sequence.fetch_add(
+                1U, std::memory_order_relaxed
+            );
+            if (sequence < 8U || sequence % 300U == 0U) {
+                trace_event(
+                    "DX11 transport depth SRV failed hr=0x%08X format=%u "
+                    "copyFormat=%u",
+                    static_cast<unsigned int>(srv_result),
+                    static_cast<unsigned int>(source_format),
+                    static_cast<unsigned int>(copy_format)
+                );
+            }
+            return false;
+        }
+        D3D11_BOX box{
+            source_x, source_y, 0U,
+            source_x + width, source_y + height, 1U
+        };
+        context->CopySubresourceRegion(
+            device.depth_copy, 0U, 0U, 0U, 0U, depth, 0U, &box
+        );
+        release(srv);
+        srv_result = device.device11->CreateShaderResourceView(
+            device.depth_copy, &srv_desc, &srv
+        );
+        if (FAILED(srv_result)) {
+            static std::atomic<std::uint64_t> copy_srv_failure_sequence{};
+            const auto sequence = copy_srv_failure_sequence.fetch_add(
+                1U, std::memory_order_relaxed
+            );
+            if (sequence < 8U || sequence % 300U == 0U) {
+                trace_event(
+                    "DX11 transport depth copy SRV failed hr=0x%08X format=%u",
+                    static_cast<unsigned int>(srv_result),
+                    static_cast<unsigned int>(source_format)
+                );
+            }
+            return false;
+        }
+        sample_x = 0U;
+        sample_y = 0U;
+    }
+    if (FAILED(device.device11->CreateUnorderedAccessView(
+            destination.texture11, &uav_desc, &uav
+        ))) {
         release(uav);
         release(srv);
+        static std::atomic<std::uint64_t> uav_failure_sequence{};
+        const auto sequence = uav_failure_sequence.fetch_add(
+            1U, std::memory_order_relaxed
+        );
+        if (sequence < 8U || sequence % 300U == 0U) {
+            trace_event("DX11 transport depth UAV failed");
+        }
         return false;
     }
 
@@ -962,7 +1143,7 @@ void trace_format_support(
         return false;
     }
     const std::uint32_t constants[4]{
-        source_x, source_y, width, height
+        sample_x, sample_y, width, height
     };
     std::memcpy(mapped.pData, constants, sizeof(constants));
     context->Unmap(device.depth_constants, 0U);
@@ -1134,6 +1315,14 @@ struct TimingScope {
     const D3D11TransportStatus status
 ) noexcept {
     diagnostic_note_d3d11_transport_status(status);
+    static std::atomic<std::uint64_t> sequence{};
+    const auto count = sequence.fetch_add(1U, std::memory_order_relaxed);
+    if (count < 16U || count % 300U == 0U) {
+        trace_event(
+            "DX11 DX12 transport rejected status=%s",
+            d3d11_transport_status_name(status)
+        );
+    }
     return false;
 }
 
@@ -1255,8 +1444,9 @@ bool evaluate_d3d11_via_d3d12(
     const auto view_id = static_cast<DlssViewId>(
         reinterpret_cast<std::uintptr_t>(game_handle)
     );
+    const bool nr_only = !settings.enabled && settings.nr_enabled;
     auto transport_settings = settings;
-    if (!transport_settings.enabled && transport_settings.nr_enabled) {
+    if (!nr_only && !transport_settings.enabled && transport_settings.nr_enabled) {
         // NR-only mode still needs the transport to run the game's SR feature
         // first. Use a full-frame SR crop, then apply the independent NR crop.
         transport_settings.enabled = true;
@@ -1328,6 +1518,23 @@ bool evaluate_d3d11_via_d3d12(
     output_texture->GetDesc(&output_desc);
     release(output_texture); release(motion_texture);
     release(depth_texture); release(color_texture);
+    {
+        static std::atomic<bool> logged_formats{};
+        if (!logged_formats.exchange(true, std::memory_order_relaxed)) {
+            trace_event(
+                "DX11 transport game formats color=%u depth=%u mv=%u output=%u "
+                "color=%ux%u depth=%ux%u mv=%ux%u output=%ux%u",
+                static_cast<unsigned int>(color_desc.Format),
+                static_cast<unsigned int>(depth_desc.Format),
+                static_cast<unsigned int>(motion_desc.Format),
+                static_cast<unsigned int>(output_desc.Format),
+                color_desc.Width, color_desc.Height,
+                depth_desc.Width, depth_desc.Height,
+                motion_desc.Width, motion_desc.Height,
+                output_desc.Width, output_desc.Height
+            );
+        }
+    }
 
     const auto width = get_ui(parameters, "Width");
     const auto height = get_ui(parameters, "Height");
@@ -1352,19 +1559,27 @@ bool evaluate_d3d11_via_d3d12(
     const auto output_y = get_ui(parameters, "DLSS.Output.Subrect.Base.Y");
     CropGeometry crop{};
     bool gaze_reset{};
-    if (render_width == 0U || render_height == 0U || out_width == 0U ||
-        out_height == 0U || color_desc.SampleDesc.Count != 1U ||
-        depth_desc.SampleDesc.Count != 1U || motion_desc.SampleDesc.Count != 1U ||
-        output_desc.SampleDesc.Count != 1U ||
-        !in_bounds(color_x, render_width, color_desc.Width) ||
-        !in_bounds(color_y, render_height, color_desc.Height) ||
-        !in_bounds(depth_x, render_width, depth_desc.Width) ||
-        !in_bounds(depth_y, render_height, depth_desc.Height) ||
-        !calculate_coordinated_crop(
+    const bool resources_ok =
+        render_width != 0U && render_height != 0U && out_width != 0U &&
+        out_height != 0U && color_desc.SampleDesc.Count == 1U &&
+        depth_desc.SampleDesc.Count == 1U && motion_desc.SampleDesc.Count == 1U &&
+        output_desc.SampleDesc.Count == 1U &&
+        in_bounds(color_x, render_width, color_desc.Width) &&
+        in_bounds(color_y, render_height, color_desc.Height) &&
+        in_bounds(depth_x, render_width, depth_desc.Width) &&
+        in_bounds(depth_y, render_height, depth_desc.Height);
+    if (resources_ok && nr_only) {
+        crop.input_width = render_width;
+        crop.input_height = render_height;
+        crop.output_width = out_width;
+        crop.output_height = out_height;
+    }
+    if (!resources_ok ||
+        (!nr_only && !calculate_coordinated_crop(
             transport_settings, view_id, output,
             render_width, render_height, out_width, out_height,
             output_x, output_y, crop, gaze_reset
-        ) ||
+        )) ||
         crop.output_width < 32U || crop.output_height < 32U) {
         const bool unsupported_samples = color_desc.SampleDesc.Count != 1U ||
             depth_desc.SampleDesc.Count != 1U ||
@@ -1376,7 +1591,7 @@ bool evaluate_d3d11_via_d3d12(
                 : D3D11TransportStatus::invalid_dimensions
         );
     }
-    if (uses_coordinated_center(transport_settings)) {
+    if (!nr_only && uses_coordinated_center(transport_settings)) {
         const auto offsets = foveation_offsets_from_geometry(
             crop, render_width, render_height
         );
@@ -1418,12 +1633,26 @@ bool evaluate_d3d11_via_d3d12(
     const auto mv_height = mv_low_res ? crop.input_height : crop.output_height;
     const auto nr_motion_width = mv_low_res ? render_width : out_width;
     const auto nr_motion_height = mv_low_res ? render_height : out_height;
+    apply_openxr_gaze_to_nr_settings(
+        nr_settings,
+        view_id,
+        output,
+        output_x,
+        output_y,
+        out_width,
+        out_height,
+        (std::max)(out_width, output_desc.Width),
+        (std::max)(out_height, output_desc.Height),
+        false
+    );
     DlssNrGeometry nr_geometry{};
     if (settings.nr_enabled && !calculate_dlss_nr_geometry(
             nr_settings,
             out_width,
             out_height,
-            nr_geometry
+            nr_geometry,
+            (std::max)(out_width, output_desc.Width),
+            (std::max)(out_height, output_desc.Height)
         )) {
         return reject_transport(D3D11TransportStatus::invalid_dimensions);
     }
@@ -1556,6 +1785,7 @@ bool evaluate_d3d11_via_d3d12(
             peripheral_dimensions.width, peripheral_dimensions.height,
             nr_motion_width, nr_motion_height,
             settings.peripheral_dlaa_enabled,
+            !nr_only,
             color_desc.Format, motion_desc.Format, output_desc.Format
         ) && !initialize_slot(
             *device, slot, crop, nr_depth_x.extent, nr_depth_y.extent,
@@ -1566,6 +1796,7 @@ bool evaluate_d3d11_via_d3d12(
             peripheral_dimensions.width, peripheral_dimensions.height,
             nr_motion_width, nr_motion_height,
             settings.peripheral_dlaa_enabled,
+            !nr_only,
             color_desc.Format, motion_desc.Format, output_desc.Format
         )) {
         release(context4);
@@ -1575,6 +1806,7 @@ bool evaluate_d3d11_via_d3d12(
     }
     TimingScope timing{context, slot};
 
+    if (!nr_only) {
     D3D11_BOX color_box{
         color_x + crop.input_base_x, color_y + crop.input_base_y, 0U,
         color_x + crop.input_base_x + crop.input_width,
@@ -1628,6 +1860,7 @@ bool evaluate_d3d11_via_d3d12(
             0U, 0U, 0U, motion, 0U, &peripheral_mv_box
         );
     }
+    }
 
     if (settings.nr_enabled) {
         if (!convert_depth_crop(
@@ -1657,6 +1890,16 @@ bool evaluate_d3d11_via_d3d12(
         );
     }
 
+    const bool measure_dlss = slot.dlss_timing_heap != nullptr &&
+        slot.dlss_timing_readback != nullptr &&
+        device->timestamp_frequency != 0U &&
+        diagnostic_should_sample_gpu_time(
+            DiagnosticGpuTiming::foveated_dlss
+        );
+    PeripheralDlaaResources peripheral{};
+    bool peripheral_ready{};
+    ID3D12CommandList* lists[]{device->command_list12};
+    if (!nr_only) {
     const auto ready_value = device->next_fence_value++;
     if (FAILED(context4->Signal(device->fence11, ready_value)) ||
         FAILED(device->queue12->Wait(device->fence12, ready_value)) ||
@@ -1675,18 +1918,9 @@ bool evaluate_d3d11_via_d3d12(
     transition(device->command_list12, slot.output.resource12,
         D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    const bool measure_dlss = slot.dlss_timing_heap != nullptr &&
-        slot.dlss_timing_readback != nullptr &&
-        device->timestamp_frequency != 0U &&
-        diagnostic_should_sample_gpu_time(
-            DiagnosticGpuTiming::foveated_dlss
-        );
     if (measure_dlss) {
         slot.dlss_peripheral_timing_recorded = false;
     }
-
-    PeripheralDlaaResources peripheral{};
-    bool peripheral_ready{};
     if (settings.peripheral_dlaa_enabled) {
         transition(
             device->command_list12, slot.peripheral_color.resource12,
@@ -1837,7 +2071,6 @@ bool evaluate_d3d11_via_d3d12(
         release(context4);
         return reject_transport(D3D11TransportStatus::synchronization_failed);
     }
-    ID3D12CommandList* lists[]{device->command_list12};
     device->queue12->ExecuteCommandLists(1U, lists);
     crop_motion12_submitted(device->queue12, 1U, lists);
     collect_crop_motion12();
@@ -1873,6 +2106,9 @@ bool evaluate_d3d11_via_d3d12(
         slot.dlss_timing_pending = measure_dlss;
         release(context4);
         return reject_transport(D3D11TransportStatus::compositing_failed);
+    }
+    } else {
+        result = 1U;
     }
 
     bool nr_succeeded{};
@@ -1987,8 +2223,6 @@ bool evaluate_d3d11_via_d3d12(
             );
             if (SUCCEEDED(device->command_list12->Close())) {
                 device->queue12->ExecuteCommandLists(1U, lists);
-                crop_motion12_submitted(device->queue12, 1U, lists);
-                collect_crop_motion12();
                 const auto nr_done_value = device->next_fence_value++;
                 if (SUCCEEDED(device->queue12->Signal(
                         device->fence12, nr_done_value

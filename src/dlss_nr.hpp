@@ -6,6 +6,8 @@
 
 #include <cstdint>
 
+struct ID3D12Device;
+
 namespace cheeky::foveated_dlss {
 
 enum class DlssNrRoute : std::uint32_t {
@@ -46,7 +48,6 @@ struct DlssNrFrame {
     std::uint32_t motion_base_y{};
     std::uint32_t motion_width{};
     std::uint32_t motion_height{};
-    // Stored motion vectors to full-output pixels (before NR working scaling).
     float motion_scale_x{1.0F};
     float motion_scale_y{1.0F};
     bool depth_inverted{};
@@ -58,8 +59,6 @@ struct DlssNrFrame {
     bool color_is_region{};
     FoveationGeometry shared_sr_crop{};
     bool has_shared_sr_crop{};
-    D3D12_RESOURCE_STATES motion_state{D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
-    bool motion_vectors_3d{};
 };
 
 struct DlssNrGeometry {
@@ -75,7 +74,9 @@ struct DlssNrGeometry {
     const Settings& settings,
     std::uint32_t output_width,
     std::uint32_t output_height,
-    DlssNrGeometry& geometry
+    DlssNrGeometry& geometry,
+    std::uint32_t travel_width = 0U,
+    std::uint32_t travel_height = 0U
 ) noexcept;
 
 struct DlssNrSnapshot {
@@ -87,6 +88,10 @@ struct DlssNrSnapshot {
     NgxResult last_result{};
     std::uint32_t output_width{};
     std::uint32_t output_height{};
+    std::uint32_t color_width{};
+    std::uint32_t color_height{};
+    std::uint32_t view_width{};
+    std::uint32_t view_height{};
     std::uint32_t region_base_x{};
     std::uint32_t region_base_y{};
     std::uint32_t region_width{};
@@ -95,6 +100,10 @@ struct DlssNrSnapshot {
     std::uint32_t working_height{};
     std::uint64_t intermediate_vram_bytes{};
 };
+
+void note_dlss_nr_host_evaluate_succeeded() noexcept;
+void note_dlss_nr_host_device(ID3D12Device* device) noexcept;
+void pump_dlss_nr_runtime() noexcept;
 
 [[nodiscard]] bool evaluate_dlss_nr(
     const DlssNrFrame& frame,

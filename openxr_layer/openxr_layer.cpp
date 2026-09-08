@@ -1129,6 +1129,77 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrSyncActions(
     return result;
 }
 
+void prepare_gaze_input(const XrSession session) noexcept {
+    PFN_xrSuggestInteractionProfileBindings suggest{};
+    PFN_xrAttachSessionActionSets attach{};
+    PFN_xrSyncActions sync{};
+    XrInstance instance_handle{XR_NULL_HANDLE};
+    XrActionSet action_set{XR_NULL_HANDLE};
+    XrAction gaze_action{XR_NULL_HANDLE};
+    XrPath gaze_path{XR_NULL_PATH};
+    XrPath gaze_profile{XR_NULL_PATH};
+    bool attached{};
+    bool binding_submitted{};
+    {
+        std::lock_guard lock(state_mutex);
+        auto* instance = find_instance_for_session_locked(session);
+        if (instance == nullptr || !instance->extension_enabled) return;
+        suggest = instance->dispatch.suggest_bindings;
+        attach = instance->dispatch.attach_action_sets;
+        sync = instance->dispatch.sync_actions;
+        instance_handle = instance->instance;
+        action_set = instance->action_set;
+        gaze_action = instance->gaze_action;
+        gaze_path = instance->gaze_path;
+        gaze_profile = instance->gaze_profile;
+        binding_submitted = instance->gaze_binding_submitted;
+        const auto session_it = sessions.find(session);
+        if (session_it == sessions.end()) return;
+        attached = session_it->second.action_attached;
+    }
+    if (action_set == XR_NULL_HANDLE || gaze_action == XR_NULL_HANDLE) return;
+    if (!binding_submitted && suggest != nullptr &&
+        gaze_path != XR_NULL_PATH && gaze_profile != XR_NULL_PATH) {
+        const XrActionSuggestedBinding binding{gaze_action, gaze_path};
+        const XrInteractionProfileSuggestedBinding info{
+            XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
+            nullptr,
+            gaze_profile,
+            1U,
+            &binding,
+        };
+        if (XR_SUCCEEDED(suggest(instance_handle, &info))) {
+            std::lock_guard lock(state_mutex);
+            const auto iterator = instances.find(instance_handle);
+            if (iterator != instances.end()) {
+                iterator->second.gaze_binding_submitted = true;
+            }
+        }
+    }
+    if (!attached && attach != nullptr) {
+        XrSessionActionSetsAttachInfo attach_info{
+            XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO
+        };
+        attach_info.countActionSets = 1U;
+        attach_info.actionSets = &action_set;
+        if (XR_SUCCEEDED(attach(session, &attach_info))) {
+            std::lock_guard lock(state_mutex);
+            const auto iterator = sessions.find(session);
+            if (iterator != sessions.end()) {
+                iterator->second.action_attached = true;
+                attached = true;
+            }
+        }
+    }
+    if (attached && sync != nullptr) {
+        const XrActiveActionSet active{action_set, XR_NULL_PATH};
+        XrActionsSyncInfo sync_info{XR_TYPE_ACTIONS_SYNC_INFO};
+        sync_info.countActiveActionSets = 1U;
+        sync_info.activeActionSets = &active;
+        static_cast<void>(sync(session, &sync_info));
+    }
+}
+
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
     const XrSession session,
     const XrViewLocateInfo* const locate_info,
@@ -1148,6 +1219,13 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         auto* instance = find_instance_for_session_locked(session);
         if (instance == nullptr) return XR_ERROR_HANDLE_INVALID;
         next = instance->dispatch.locate_views;
+    }
+    if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    prepare_gaze_input(session);
+    {
+        std::lock_guard lock(state_mutex);
+        auto* instance = find_instance_for_session_locked(session);
+        if (instance == nullptr) return XR_ERROR_HANDLE_INVALID;
         get_pose = instance->dispatch.get_action_state_pose;
         locate_space = instance->dispatch.locate_space;
         gaze_action = instance->gaze_action;
@@ -1155,7 +1233,6 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         gaze_space = session_state.gaze_space;
         action_attached = session_state.action_attached;
     }
-    if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
     const auto result = next(
         session, locate_info, view_state, capacity, count, views
     );

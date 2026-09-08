@@ -6,7 +6,6 @@
 #include "gaze_foveation.hpp"
 #include "runtime.hpp"
 #include "settings.hpp"
-#include "support_report.hpp"
 #include "cheeky_gaze_abi.h"
 #include "version.h"
 
@@ -462,7 +461,7 @@ void draw_d3d12_gpu_performance(
     }
 }
 
-void draw_performance() {
+[[maybe_unused]] void draw_performance() {
     const auto& d3d11 = displayed_diagnostics(DiagnosticApi::d3d11);
     const auto& d3d12 = displayed_diagnostics(DiagnosticApi::d3d12);
     const bool d3d11_active = d3d11.evaluate_calls != 0U;
@@ -522,6 +521,18 @@ void draw_nr_performance() {
                 "DLSS-SR output", "%u x %u",
                 data.output_width, data.output_height
             );
+            if (data.color_width != 0U &&
+                (data.color_width != data.output_width ||
+                    data.color_height != data.output_height)) {
+                diagnostic_row(
+                    "Displayed color", "%u x %u",
+                    data.color_width, data.color_height
+                );
+            }
+            const auto percent_width =
+                data.view_width != 0U ? data.view_width : data.output_width;
+            const auto percent_height =
+                data.view_height != 0U ? data.view_height : data.output_height;
             diagnostic_row(
                 "DLSS-NR region", "%u x %u (%.1f%%) at %u,%u",
                 data.region_width,
@@ -529,8 +540,8 @@ void draw_nr_performance() {
                 pixel_percentage(
                     data.region_width,
                     data.region_height,
-                    data.output_width,
-                    data.output_height
+                    percent_width,
+                    percent_height
                 ),
                 data.region_base_x,
                 data.region_base_y
@@ -594,7 +605,7 @@ void draw_nr_performance() {
 
 void draw_openxr_gaze_diagnostics() {
     const auto gaze = gaze_diagnostics();
-    ImGui::TextUnformatted("VR eye tracking");
+    ImGui::TextUnformatted("OpenXR eye tracking");
     DiagnosticTable table{"OpenXRGazeDiagnostics"};
     if (!table) return;
     diagnostic_row(
@@ -603,12 +614,13 @@ void draw_openxr_gaze_diagnostics() {
     );
     diagnostic_row("Simulated gaze", "%s", yes_no(
         (gaze.status_flags & CHEEKY_GAZE_STATUS_SIMULATED) != 0U));
-    diagnostic_row("Runtime adapter loaded", "%s", yes_no(gaze.layer_present));
-    diagnostic_row("Backend", "%s", (gaze.status_flags & CHEEKY_GAZE_STATUS_OPENVR) ? "OpenVR" : gaze.layer_present ? "OpenXR" : "Not detected");
+    diagnostic_row("Layer loaded", "%s", yes_no(gaze.layer_present));
     diagnostic_row("Snapshot ABI", "%s", yes_no(gaze.abi_compatible));
-    diagnostic_row("Eye gaze extension", "%s",
-        (gaze.status_flags & CHEEKY_GAZE_STATUS_OPENVR) ? "N/A (native OpenVR)" :
-        yes_no((gaze.status_flags & CHEEKY_GAZE_STATUS_EXTENSION_ENABLED) != 0U));
+    diagnostic_row(
+        "Eye gaze extension", "%s", yes_no(
+            (gaze.status_flags & CHEEKY_GAZE_STATUS_EXTENSION_ENABLED) != 0U
+        )
+    );
     diagnostic_row(
         "System support", "%s", yes_no(
             (gaze.status_flags & CHEEKY_GAZE_STATUS_SYSTEM_SUPPORTED) != 0U
@@ -620,7 +632,7 @@ void draw_openxr_gaze_diagnostics() {
         )
     );
     diagnostic_row(
-        "Gaze input active", "%s", yes_no(
+        "Gaze action active", "%s", yes_no(
             (gaze.status_flags & CHEEKY_GAZE_STATUS_ACTION_ACTIVE) != 0U
         )
     );
@@ -630,7 +642,7 @@ void draw_openxr_gaze_diagnostics() {
         )
     );
     diagnostic_row(
-        "Submission mapping ready", "%s", yes_no(
+        "Layer mapping ready", "%s", yes_no(
             (gaze.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U
         )
     );
@@ -654,7 +666,7 @@ void draw_openxr_gaze_diagnostics() {
         char label[32]{};
         static_cast<void>(sprintf_s(label, "Eye %zu alignment", index));
         diagnostic_row(label, "%s (%.4f, %.4f)",
-            view.alignment_source == 3U ? "OpenVR" : view.alignment_source == 2U ? "OpenXR" :
+            view.alignment_source == 2U ? "OpenXR" :
             view.alignment_source == 1U ? "Streamline" : "Manual fallback",
             view.aligned_u, view.aligned_v);
         static_cast<void>(sprintf_s(
@@ -681,7 +693,7 @@ void draw_openxr_gaze_diagnostics() {
             label, "Eye %zu crop delta", index
         ));
         diagnostic_row(label, "%d, %d px", view.crop_delta_x, view.crop_delta_y);
-        static_cast<void>(sprintf_s(label, "Eye %zu VR texture", index));
+        static_cast<void>(sprintf_s(label, "Eye %zu XR texture", index));
         diagnostic_row(label, "0x%llX (%d,%d %ux%u) slice %u",
             static_cast<unsigned long long>(view.xr_resource), view.xr_x, view.xr_y,
             view.xr_width, view.xr_height, view.xr_array);
@@ -700,12 +712,18 @@ void draw_openxr_gaze_diagnostics() {
     );
 }
 
+void save_settings_to_reshade(const Settings& settings) noexcept;
+
 void load_settings_from_reshade() noexcept {
     auto settings = current_settings();
+    settings.enabled = false;
+    settings.peripheral_dlaa_enabled = false;
+    settings.nr_use_sr_foveation = false;
     auto center_mode = static_cast<std::uint32_t>(settings.center_mode);
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "Enabled", settings.enabled
     ));
+    settings.enabled = false;
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "D3D11D3D12Transport",
         settings.d3d11_use_d3d12_transport
@@ -714,6 +732,7 @@ void load_settings_from_reshade() noexcept {
         nullptr, config_section, "PeripheralDlaa",
         settings.peripheral_dlaa_enabled
     ));
+    settings.peripheral_dlaa_enabled = false;
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "PeripheralDlaaScale",
         settings.peripheral_dlaa_scale
@@ -791,6 +810,7 @@ void load_settings_from_reshade() noexcept {
         nullptr, config_section, "NrUseSrFoveation",
         settings.nr_use_sr_foveation
     ));
+    settings.nr_use_sr_foveation = false;
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "NrAlignmentBorder",
         settings.nr_alignment_border_enabled
@@ -802,6 +822,21 @@ void load_settings_from_reshade() noexcept {
         nullptr, config_section, "NrHeight", settings.nr_height
     ));
     static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "NrXOffset", settings.nr_x_offset
+    ));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "NrCenterX", settings.nr_center_x
+    ));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "NrHeightOffset", settings.nr_height_offset
+    ));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "NrSourceX", settings.nr_source_x
+    ));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "NrSourceY", settings.nr_source_y
+    ));
+    static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "NrRoundness", settings.nr_roundness
     ));
     static_cast<void>(reshade::get_config_value(
@@ -811,6 +846,7 @@ void load_settings_from_reshade() noexcept {
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "NrWorkingScale", settings.nr_working_scale
     ));
+    settings.nr_working_scale = std::clamp(settings.nr_working_scale, 0.10F, 1.0F);
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "NrPreset", settings.nr_preset
     ));
@@ -863,15 +899,14 @@ void load_settings_from_reshade() noexcept {
 
 void save_settings_to_reshade(const Settings& settings) noexcept {
     reshade::set_config_value(
-        nullptr, config_section, "Enabled", settings.enabled
+        nullptr, config_section, "Enabled", false
     );
     reshade::set_config_value(
         nullptr, config_section, "D3D11D3D12Transport",
         settings.d3d11_use_d3d12_transport
     );
     reshade::set_config_value(
-        nullptr, config_section, "PeripheralDlaa",
-        settings.peripheral_dlaa_enabled
+        nullptr, config_section, "PeripheralDlaa", false
     );
     reshade::set_config_value(
         nullptr, config_section, "PeripheralDlaaScale",
@@ -943,8 +978,7 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
         nullptr, config_section, "NrFoveated", settings.nr_foveated
     );
     reshade::set_config_value(
-        nullptr, config_section, "NrUseSrFoveation",
-        settings.nr_use_sr_foveation
+        nullptr, config_section, "NrUseSrFoveation", false
     );
     reshade::set_config_value(
         nullptr, config_section, "NrAlignmentBorder",
@@ -952,6 +986,13 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
     );
     reshade::set_config_value(nullptr, config_section, "NrWidth", settings.nr_width);
     reshade::set_config_value(nullptr, config_section, "NrHeight", settings.nr_height);
+    reshade::set_config_value(nullptr, config_section, "NrXOffset", settings.nr_x_offset);
+    reshade::set_config_value(nullptr, config_section, "NrCenterX", settings.nr_center_x);
+    reshade::set_config_value(
+        nullptr, config_section, "NrHeightOffset", settings.nr_height_offset
+    );
+    reshade::set_config_value(nullptr, config_section, "NrSourceX", settings.nr_source_x);
+    reshade::set_config_value(nullptr, config_section, "NrSourceY", settings.nr_source_y);
     reshade::set_config_value(
         nullptr, config_section, "NrRoundness", settings.nr_roundness
     );
@@ -1009,7 +1050,7 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
     );
 }
 
-void draw_sr_controls(Settings& settings, bool& changed) {
+[[maybe_unused]] void draw_sr_controls(Settings& settings, bool& changed) {
     static bool size_drafts_initialized{};
     static bool editing_width{};
     static bool editing_height{};
@@ -1089,43 +1130,33 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     ImGui::TextDisabled(
         "Downscale periphery even more from original resolution"
     );
-    int center_mode = static_cast<int>(settings.center_mode);
+    int center_mode = 0;
+    if (settings.center_mode == FoveationCenterMode::openxr_gaze) {
+        center_mode = 1;
+    } else if (settings.center_mode == FoveationCenterMode::simulated_gaze) {
+        center_mode = 2;
+    }
     if (ImGui::Combo(
             "Foveation center",
             &center_mode,
-            "Fixed\0Runtime gaze (OpenXR / OpenVR)\0Simulated gaze (debug)\0"
+            "Fixed\0OpenXR gaze\0Simulated gaze (debug)\0"
         )) {
-        settings.center_mode = static_cast<FoveationCenterMode>(center_mode);
+        settings.center_mode = center_mode == 1
+            ? FoveationCenterMode::openxr_gaze
+            : center_mode == 2
+                ? FoveationCenterMode::simulated_gaze
+                : FoveationCenterMode::fixed;
         changed = true;
-    }
-    if (settings.center_mode == FoveationCenterMode::openxr_gaze) {
-        const auto gaze = gaze_diagnostics();
-        const char* unavailable{};
-        if (!gaze.layer_present)
-            unavailable = "Eye tracking unavailable: no active OpenXR layer or supported OpenVR adapter. Using fixed placement.";
-        else if (!gaze.abi_compatible)
-            unavailable = "Eye tracking unavailable: update the OpenXR layer to match this add-on.";
-        else if ((gaze.status_flags & CHEEKY_GAZE_STATUS_SYSTEM_SUPPORTED) == 0U)
-            unavailable = "Eye tracking not detected. Using fixed placement.";
-        else if ((gaze.status_flags & CHEEKY_GAZE_STATUS_GAZE_VALID) == 0U)
-            unavailable = "No valid eye-tracking signal. Using fixed fallback.";
-        else if (!gaze.using_gaze)
-            unavailable = "Eye tracking is not driving foveation: waiting for eye mapping.";
-        if (unavailable != nullptr) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.25F, 0.25F, 1.0F));
-            ImGui::TextWrapped("%s", unavailable);
-            ImGui::PopStyleColor();
-        }
     }
     changed |= ImGui::Checkbox("Automatic stereo alignment", &settings.auto_stereo_alignment);
     if (settings.auto_stereo_alignment) {
         ImGui::TextDisabled("Aligns fixed placement and the fallback when gaze is unavailable.");
         const auto source = gaze_diagnostics().alignment_source;
-        ImGui::TextDisabled("Latest alignment: %s", source == 3U ? "OpenVR" : source == 2U ? "OpenXR" :
+        ImGui::TextDisabled("Latest alignment: %s", source == 2U ? "OpenXR" :
             source == 1U ? "Streamline projection" : "Manual fallback");
     }
     if (settings.center_mode != FoveationCenterMode::fixed) {
-        ImGui::TextDisabled("Gaze uses the active OpenXR layer or OpenVR adapter; alignment needs no eye tracker.");
+        ImGui::TextDisabled("Gaze requires the OpenXR layer; alignment needs no eye tracker.");
     }
     if (settings.center_mode == FoveationCenterMode::simulated_gaze) {
         int pattern = static_cast<int>(settings.simulation_pattern);
@@ -1347,43 +1378,158 @@ void draw_nr_controls(Settings& settings, bool& changed) {
 
     changed |= ImGui::Checkbox("Foveated DLSS-NR", &settings.nr_foveated);
     if (settings.nr_foveated) {
-        ImGui::TextDisabled("Position follows DLSS-SR; NR size and shape can differ.");
-        changed |= ImGui::Checkbox(
-            "Use DLSS-SR size and shape",
-            &settings.nr_use_sr_foveation
-        );
-        if (settings.nr_use_sr_foveation) {
+        int center_mode = 0;
+        if (settings.center_mode == FoveationCenterMode::openxr_gaze) {
+            center_mode = 1;
+        } else if (settings.center_mode == FoveationCenterMode::simulated_gaze) {
+            center_mode = 2;
+        }
+        if (ImGui::Combo(
+                "NR fovea center",
+                &center_mode,
+                "Fixed\0OpenXR gaze\0Simulated gaze (debug)\0"
+            )) {
+            settings.center_mode = center_mode == 1
+                ? FoveationCenterMode::openxr_gaze
+                : center_mode == 2
+                    ? FoveationCenterMode::simulated_gaze
+                    : FoveationCenterMode::fixed;
+            changed = true;
+        }
+        if (settings.center_mode == FoveationCenterMode::fixed) {
             ImGui::TextDisabled(
-                "Width, height, roundness, and transition follow DLSS-SR."
+                "No eye tracker needed. Zeroed origin sliders sit on each eye's view-center."
             );
         } else {
-            deferred_slider(
-                "NR fovea width",
-                settings.nr_width,
-                drafts.width,
-                drafts.editing_width,
-                0.20F,
-                1.0F,
-                "%.2f"
-            );
-            deferred_slider(
-                "NR fovea height",
-                settings.nr_height,
-                drafts.height,
-                drafts.editing_height,
-                0.20F,
-                1.0F,
-                "%.2f"
-            );
-            changed |= ImGui::SliderFloat(
-                "NR roundness", &settings.nr_roundness,
-                0.0F, 1.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp
-            );
-            changed |= ImGui::SliderFloat(
-                "NR transition width", &settings.nr_transition_width,
-                0.0F, 0.30F, "%.3f", ImGuiSliderFlags_AlwaysClamp
+            ImGui::TextDisabled(
+                "Each eye follows that eye's OpenXR gaze. Origin sliders stay a bias; "
+                "if tracking is lost the crop returns to those sliders. Needs CheekyOpenXRLayer.dll. "
+                "Does not rewrite game DLSS-SR."
             );
         }
+        if (settings.center_mode == FoveationCenterMode::simulated_gaze) {
+            int pattern = static_cast<int>(settings.simulation_pattern);
+            if (ImGui::Combo(
+                    "Simulation pattern",
+                    &pattern,
+                    "Figure eight (8 s)\0Slow sweep (20 s)\0Jump every 2 s\0Jump every 8 s\0Tracking loss\0Hold center\0"
+                )) {
+                settings.simulation_pattern = static_cast<std::uint32_t>(pattern);
+                changed = true;
+            }
+        }
+        ImGui::TextDisabled(
+            "NR crop on the game's native DLSS output. Width/height are a fraction "
+            "of the displayed color view. If the color texture is larger than DLSS "
+            "OutWidth, 1.00 is that whole picture."
+        );
+        deferred_slider(
+            "NR fovea width",
+            settings.nr_width,
+            drafts.width,
+            drafts.editing_width,
+            0.20F,
+            1.0F,
+            "%.2f"
+        );
+        deferred_slider(
+            "NR fovea height",
+            settings.nr_height,
+            drafts.height,
+            drafts.editing_height,
+            0.20F,
+            1.0F,
+            "%.2f"
+        );
+        changed |= ImGui::SliderFloat(
+            settings.center_mode == FoveationCenterMode::fixed
+                ? "NR origin X / center X"
+                : "NR fallback origin X",
+            &settings.nr_center_x,
+            -1.0F,
+            1.0F,
+            "%.2f",
+            ImGuiSliderFlags_AlwaysClamp
+        );
+        ImGui::TextDisabled(
+            settings.center_mode == FoveationCenterMode::fixed
+                ? "Both eyes. Zero is that eye's center. Units are the full displayed "
+                  "texture width, so +0.5 can move the box into the other eye."
+                : "Added on top of valid gaze. When tracking is lost this is the crop center."
+        );
+        changed |= ImGui::SliderFloat(
+            settings.center_mode == FoveationCenterMode::fixed
+                ? "NR origin Y / height offset"
+                : "NR fallback origin Y",
+            &settings.nr_height_offset,
+            -1.0F,
+            1.0F,
+            "%.2f",
+            ImGuiSliderFlags_AlwaysClamp
+        );
+        ImGui::TextDisabled("Negative moves up, positive moves down. Zero is the displayed-view center.");
+        changed |= ImGui::SliderFloat(
+            "NR stereo X offset",
+            &settings.nr_x_offset,
+            -1.0F,
+            1.0F,
+            "%.2f",
+            ImGuiSliderFlags_AlwaysClamp
+        );
+        ImGui::TextDisabled("Per-eye, applied after center X. Equal and opposite.");
+        changed |= ImGui::SliderFloat(
+            "NR source X",
+            &settings.nr_source_x,
+            -2048.0F,
+            2048.0F,
+            "%.0f px",
+            ImGuiSliderFlags_AlwaysClamp
+        );
+        changed |= ImGui::SliderFloat(
+            "NR source Y",
+            &settings.nr_source_y,
+            -2048.0F,
+            2048.0F,
+            "%.0f px",
+            ImGuiSliderFlags_AlwaysClamp
+        );
+        ImGui::TextDisabled(
+            "Texture origin vs visible picture. Use if a zeroed box sits off-center."
+        );
+        if (ImGui::TreeNode("Stereo mapping override")) {
+            changed |= ImGui::Checkbox(
+                "Invert stereo eye order",
+                &settings.invert_stereo_x_offset
+            );
+            ImGui::TextDisabled(
+                "For packed layouts or gaze mapping with reversed eye order; normally leave off."
+            );
+            ImGui::TreePop();
+        }
+        if ((settings.center_mode == FoveationCenterMode::openxr_gaze ||
+             settings.center_mode == FoveationCenterMode::simulated_gaze) &&
+            ImGui::TreeNode("Advanced eye tracking")) {
+            changed |= ImGui::SliderFloat(
+                "Gaze smoothing",
+                &settings.gaze_smoothing_ms,
+                0.0F,
+                100.0F,
+                "%.0f ms",
+                ImGuiSliderFlags_AlwaysClamp
+            );
+            ImGui::TextDisabled(
+                "History and crop quantization still use the OpenXR coordinator; they do not rewrite DLSS-SR."
+            );
+            ImGui::TreePop();
+        }
+        changed |= ImGui::SliderFloat(
+            "NR roundness", &settings.nr_roundness,
+            0.0F, 1.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp
+        );
+        changed |= ImGui::SliderFloat(
+            "NR transition width", &settings.nr_transition_width,
+            0.0F, 0.30F, "%.3f", ImGuiSliderFlags_AlwaysClamp
+        );
     }
     changed |= ImGui::Checkbox(
         "Show 5 px green alignment border",
@@ -1399,6 +1545,10 @@ void draw_nr_controls(Settings& settings, bool& changed) {
         0.10F,
         1.0F,
         "%.2f"
+    );
+    ImGui::TextDisabled(
+        "1.00 is native on the crop. Lower values run NR at a smaller working "
+        "size, then the codec scales back to the crop. Does not rewrite game DLSS-SR."
     );
     int preset = static_cast<int>(settings.nr_preset);
     if (ImGui::Combo(
@@ -1470,13 +1620,21 @@ void draw_nr_controls(Settings& settings, bool& changed) {
         const Settings defaults{};
         settings.nr_enabled = defaults.nr_enabled;
         settings.nr_foveated = defaults.nr_foveated;
-        settings.nr_use_sr_foveation = defaults.nr_use_sr_foveation;
+        settings.nr_use_sr_foveation = false;
         settings.nr_alignment_border_enabled =
             defaults.nr_alignment_border_enabled;
         settings.nr_width = defaults.nr_width;
         settings.nr_height = defaults.nr_height;
+        settings.nr_center_x = defaults.nr_center_x;
+        settings.nr_x_offset = defaults.nr_x_offset;
+        settings.nr_height_offset = defaults.nr_height_offset;
+        settings.nr_source_x = defaults.nr_source_x;
+        settings.nr_source_y = defaults.nr_source_y;
         settings.nr_roundness = defaults.nr_roundness;
         settings.nr_transition_width = defaults.nr_transition_width;
+        settings.center_mode = defaults.center_mode;
+        settings.simulation_pattern = defaults.simulation_pattern;
+        settings.gaze_smoothing_ms = defaults.gaze_smoothing_ms;
         settings.nr_working_scale = defaults.nr_working_scale;
         settings.nr_preset = defaults.nr_preset;
         settings.nr_intensity = defaults.nr_intensity;
@@ -1512,10 +1670,13 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
     );
     bool changed{};
 
-    ImGui::TextDisabled("Cheeky Foveated DLSS v" CHEEKY_VERSION);
+    ImGui::TextDisabled("Cheeky Foveated DLSS-NR v" CHEEKY_VERSION);
     ImGui::Separator();
     ImGui::TextUnformatted("Changes apply live to the next DLSS evaluation.");
-    ImGui::TextDisabled("DX12 Transport enables DX12 features for DX11 games.");
+    ImGui::TextDisabled(
+        "Game DLSS-SR is left native. This add-on only runs DLSS-NR after evaluate."
+    );
+    ImGui::TextDisabled("DX12 Transport enables DX12 NR for DX11 games.");
     int d3d11_path = settings.d3d11_use_d3d12_transport ? 1 : 0;
     if (ImGui::Combo(
             "DX11 game processing path",
@@ -1527,29 +1688,14 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
     }
 
     ImGui::Spacing();
-    if (ImGui::CollapsingHeader("DLSS-SR", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (ImGui::TreeNodeEx(
-                "Controls##dlss_sr",
-                ImGuiTreeNodeFlags_DefaultOpen
-            )) {
-            draw_sr_controls(settings, changed);
-            ImGui::TreePop();
-        }
-        if (ImGui::TreeNodeEx(
-                "Performance##dlss_sr",
-                ImGuiTreeNodeFlags_DefaultOpen
-            )) {
-            draw_performance();
-            ImGui::TreePop();
-        }
-    }
-
     if (ImGui::CollapsingHeader(
-            "DLSS-NR (Experimental)", ImGuiTreeNodeFlags_DefaultOpen
+            "DLSS-NR", ImGuiTreeNodeFlags_DefaultOpen
         )) {
         changed |= ImGui::Checkbox(
             "Enable DLSS-NR (DLSS 5)", &settings.nr_enabled
         );
+        ImGui::SameLine();
+        ImGui::TextDisabled("(Alt+Shift+/)");
         ImGui::TextDisabled(
             "Requires nvngx_dlssnr.dll beside this add-on and a DX12 processing path."
         );
@@ -1575,8 +1721,6 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
         update_settings(settings);
         save_settings_to_reshade(settings);
     }
-
-    draw_support_report(addon_module.load(std::memory_order_acquire));
 
     if (ImGui::CollapsingHeader(
             "Diagnostics",
@@ -1624,12 +1768,12 @@ void on_present(
         down, std::memory_order_acq_rel
     );
     if (down && !was_down) {
-        settings.enabled = !settings.enabled;
+        settings.nr_enabled = !settings.nr_enabled;
         update_settings(settings);
         save_settings_to_reshade(settings);
         trace_event(
-            "Foveated DLSS hotkey Alt+Shift+/ toggled enabled=%s",
-            settings.enabled ? "yes" : "no"
+            "DLSS-NR hotkey Alt+Shift+/ toggled enabled=%s",
+            settings.nr_enabled ? "yes" : "no"
         );
     }
 }
@@ -1855,7 +1999,7 @@ void log_error(const char* const message) noexcept {
 
 extern "C" __declspec(dllexport) const char* NAME = "Cheeky Foveated DLSS";
 extern "C" __declspec(dllexport) const char* DESCRIPTION =
-    "Configurable foveated DLSS Super Resolution and DLSS-NR for Direct3D 11 and 12.";
+    "Foveated DLSS-NR after native DLSS Super Resolution for Direct3D 11 and 12.";
 
 extern "C" __declspec(dllexport) bool AddonInit(
     const HMODULE addon,
@@ -1880,7 +2024,7 @@ extern "C" __declspec(dllexport) bool AddonInit(
     reshade::register_event<reshade::addon_event::reset_command_list>(&on_gaze_reset_list);
     reshade::register_event<reshade::addon_event::destroy_command_list>(&on_gaze_reset_list);
     reshade::register_event<reshade::addon_event::destroy_resource>(&on_gaze_destroy_resource);
-    log_info("Foveated DLSS-SR and DLSS-NR interception started for D3D11 and D3D12.");
+    log_info("DLSS-NR interception started for D3D11 and D3D12.");
     trace_event("AddonInit complete");
     return true;
 }
@@ -1901,14 +2045,13 @@ extern "C" __declspec(dllexport) void AddonUninit(
         &on_execute_command_list
     );
     reshade::unregister_overlay(nullptr, &draw_settings_overlay);
-    finish_support_report();
     stop_interception();
     release_d3d11_d3d12_transport();
     release_d3d11_resources();
     release_d3d12_resources();
     release_dlss_nr_resources();
     reset_gaze_foveation();
-    log_info("Foveated DLSS-SR and DLSS-NR interception stopped.");
+    log_info("DLSS-NR interception stopped.");
     close_trace_log();
 }
 

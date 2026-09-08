@@ -43,7 +43,7 @@ struct GazeDiagnostics {
     bool layer_present{};
     bool abi_compatible{};
     bool using_gaze{};
-    // Latest evaluated view: 0 manual fallback, 1 Streamline, 2 OpenXR, 3 OpenVR.
+    // Latest evaluated view: 0 manual fallback, 1 Streamline, 2 OpenXR.
     unsigned alignment_source{};
     bool mapping_ambiguous{};
     GazeResetReason last_reset_reason{GazeResetReason::none};
@@ -73,5 +73,21 @@ void record_gaze_copy(std::uint64_t command_list, GazeCopyEdge edge) noexcept;
 void submit_gaze_copies(std::uint64_t command_list) noexcept;
 void reset_gaze_copies(std::uint64_t command_list) noexcept;
 void forget_gaze_resource(std::uint64_t resource) noexcept;
+
+// Optional OpenXR / simulated gaze for NR. Fixed mode leaves sliders alone.
+// refresh_sample maps this DLSS/NR output to an XR eye; skip it when the
+// coordinator already ran this frame (DX11 transport).
+void apply_openxr_gaze_to_nr_settings(
+    Settings& settings,
+    DlssViewId view_id,
+    IUnknown* output_resource,
+    std::uint32_t output_origin_x,
+    std::uint32_t output_origin_y,
+    std::uint32_t view_width,
+    std::uint32_t view_height,
+    std::uint32_t travel_width,
+    std::uint32_t travel_height,
+    bool refresh_sample
+) noexcept;
 
 }  // namespace cheeky::foveated_dlss
