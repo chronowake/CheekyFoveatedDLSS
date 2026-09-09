@@ -1,3 +1,7 @@
+This is a DLSS 5 NR-only focused fork of Cheeky Foveated DLSS. SR is stripped out along with a few other changes to make it compatible with Luke Ross's R.E.A.L. VR Framework. All future changes will be to meet that end. If the original project becomes widely compatible with REAL VR, I will most likely drop this fork and recommend using that instead. Thank you to ClarkCheekyKent for this amazing addon!  
+
+
+######################################################################## ORIGINAL README FOLLOWS BELOW #########################################################################################################################################
 # Cheeky Foveated DLSS
 
 Cheeky Foveated DLSS is a 64-bit [ReShade](https://reshade.me/) add-on that reduces the cost of DLSS Super Resolution by applying it to the part of the image that matters most. It supports Direct3D 11 and Direct3D 12 games, including stereo rendering for VR.
