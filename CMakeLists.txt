@@ -74,7 +74,7 @@ set_target_properties(
     PROPERTIES
         CXX_EXTENSIONS OFF
         PREFIX ""
-        OUTPUT_NAME "CheekyFoveatedDLSS"
+        OUTPUT_NAME "SomewhatCheekyFoveatedDLSS"
         SUFFIX ".addon64"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>"

@@ -32,6 +32,12 @@ std::atomic<std::uint32_t> gaze_smoothing_ms_bits{0x41A00000U};
 std::atomic<std::uint32_t> gaze_quantization_pixels{8U};
 std::atomic<std::uint32_t> gaze_jump_reset_ratio_bits{0x3E000000U};
 std::atomic<bool> nr_enabled{false};
+std::atomic<bool> nr_before_sr{false};
+std::atomic<bool> nr_after_polish{false};
+std::atomic<std::uint32_t> nr_toggle_vk{0x4E};
+std::atomic<bool> nr_toggle_ctrl{false};
+std::atomic<bool> nr_toggle_alt{false};
+std::atomic<bool> nr_toggle_shift{false};
 std::atomic<bool> nr_foveated{true};
 std::atomic<bool> nr_use_sr_foveation{false};
 std::atomic<bool> nr_alignment_border_enabled{false};
@@ -139,6 +145,12 @@ Settings current_settings() noexcept {
         gaze_jump_reset_ratio_bits
     );
     settings.nr_enabled = nr_enabled.load(std::memory_order_acquire);
+    settings.nr_before_sr = nr_before_sr.load(std::memory_order_acquire);
+    settings.nr_after_polish = nr_after_polish.load(std::memory_order_acquire);
+    settings.nr_toggle_vk = nr_toggle_vk.load(std::memory_order_acquire);
+    settings.nr_toggle_ctrl = nr_toggle_ctrl.load(std::memory_order_acquire);
+    settings.nr_toggle_alt = nr_toggle_alt.load(std::memory_order_acquire);
+    settings.nr_toggle_shift = nr_toggle_shift.load(std::memory_order_acquire);
     settings.nr_foveated = nr_foveated.load(std::memory_order_acquire);
     settings.nr_use_sr_foveation = false;
     settings.nr_alignment_border_enabled =
@@ -239,6 +251,12 @@ void update_settings(const Settings& settings) noexcept {
         std::clamp(settings.gaze_jump_reset_ratio, 0.01F, 1.0F)
     );
     nr_enabled.store(settings.nr_enabled, std::memory_order_release);
+    nr_before_sr.store(settings.nr_before_sr, std::memory_order_release);
+    nr_after_polish.store(settings.nr_after_polish, std::memory_order_release);
+    nr_toggle_vk.store(settings.nr_toggle_vk, std::memory_order_release);
+    nr_toggle_ctrl.store(settings.nr_toggle_ctrl, std::memory_order_release);
+    nr_toggle_alt.store(settings.nr_toggle_alt, std::memory_order_release);
+    nr_toggle_shift.store(settings.nr_toggle_shift, std::memory_order_release);
     nr_foveated.store(settings.nr_foveated, std::memory_order_release);
     nr_use_sr_foveation.store(false, std::memory_order_release);
     nr_alignment_border_enabled.store(

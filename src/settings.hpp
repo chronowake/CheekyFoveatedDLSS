@@ -41,6 +41,12 @@ struct Settings {
     float gaze_jump_reset_ratio{0.125F};
 
     bool nr_enabled{false};
+    bool nr_before_sr{false};
+    bool nr_after_polish{false};
+    std::uint32_t nr_toggle_vk{0x4E};
+    bool nr_toggle_ctrl{};
+    bool nr_toggle_alt{};
+    bool nr_toggle_shift{};
     bool nr_foveated{true};
     bool nr_use_sr_foveation{false};
     bool nr_alignment_border_enabled{false};
@@ -72,6 +78,11 @@ struct Settings {
 
 inline bool uses_coordinated_center(const Settings& settings) noexcept {
     return settings.auto_stereo_alignment || settings.center_mode != FoveationCenterMode::fixed;
+}
+
+[[nodiscard]] inline bool nr_runs_after_upscale(const Settings& settings) noexcept {
+    return settings.nr_enabled &&
+        (!settings.nr_before_sr || settings.nr_after_polish);
 }
 
 using CropGeometry = FoveationGeometry;

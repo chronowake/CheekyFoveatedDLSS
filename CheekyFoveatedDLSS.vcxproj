@@ -41,7 +41,7 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
-    <TargetName>CheekyFoveatedDLSS</TargetName>
+    <TargetName>SomewhatCheekyFoveatedDLSS</TargetName>
     <TargetExt>.addon64</TargetExt>
     <OutDir>$(MSBuildThisFileDirectory)bin\$(Configuration)\</OutDir>
     <IntDir>$(MSBuildThisFileDirectory)build\msbuild\$(Configuration)\</IntDir>

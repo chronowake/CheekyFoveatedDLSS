@@ -55,6 +55,22 @@ void release(T*& object) noexcept {
     }
 }
 
+[[nodiscard]] bool same_d3d12_device(
+    ID3D12Device* const left,
+    ID3D12Device* const right
+) noexcept {
+    if (left == right) return true;
+    if (left == nullptr || right == nullptr) return false;
+    IUnknown* left_identity{};
+    IUnknown* right_identity{};
+    const bool left_ok = SUCCEEDED(left->QueryInterface(IID_PPV_ARGS(&left_identity)));
+    const bool right_ok = SUCCEEDED(right->QueryInterface(IID_PPV_ARGS(&right_identity)));
+    const bool same = left_ok && right_ok && left_identity == right_identity;
+    release(left_identity);
+    release(right_identity);
+    return same;
+}
+
 struct RuntimeState {
     HMODULE module{};
     HMODULE addon{};
@@ -73,11 +89,21 @@ std::atomic<bool> host_evaluate_succeeded{};
 std::atomic<bool> runtime_load_started{};
 ID3D12Device* pending_device{};
 
+// Feature 18 sees a 0-1 Reinhard proxy, not Luma's linear HDR Color.
+// Bit 0 (IsHDR) would tell NR the input is linear HDR; that clipped
+// highlights to 1 and crushed green. Keep MV-low-res and depth-inverted.
+[[nodiscard]] constexpr std::uint32_t nr_feature_create_flags(
+    const std::uint32_t game_create_flags
+) noexcept {
+    return game_create_flags & ~1U;
+}
+
 struct FeatureKey {
     std::uint32_t input_width{};
     std::uint32_t input_height{};
     std::uint32_t output_width{};
     std::uint32_t output_height{};
+    std::uint32_t create_flags{};
 };
 
 struct NrRegion {
@@ -137,6 +163,18 @@ struct ViewState {
     bool logged_crop{};
     std::deque<CachedFeature> retired_features;
     std::deque<GpuResources> gpu_resources;
+    ID3D12Resource* input_scratch{};
+    std::uint32_t scratch_width{};
+    std::uint32_t scratch_height{};
+    DXGI_FORMAT scratch_format{DXGI_FORMAT_UNKNOWN};
+    ID3D12Resource* sample_readback{};
+    bool samples_pending{};
+    std::uint32_t sample_crop_width{};
+    std::uint32_t sample_crop_height{};
+    std::uint32_t sample_proxy_width{};
+    std::uint32_t sample_proxy_height{};
+    std::uint32_t sample_format{};
+    float sample_paper_white{1.0F};
 };
 
 std::mutex nr_mutex;
@@ -179,6 +217,12 @@ void release_feature(ViewState& view) noexcept {
         }
     }
     view.retired_features.clear();
+    release(view.input_scratch);
+    view.scratch_width = 0U;
+    view.scratch_height = 0U;
+    view.scratch_format = DXGI_FORMAT_UNKNOWN;
+    release(view.sample_readback);
+    view.samples_pending = false;
 }
 
 void evict_retired_features(ViewState& view) noexcept {
@@ -481,11 +525,13 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     const std::uint32_t working_width,
     const std::uint32_t working_height
 ) noexcept {
+    const auto create_flags = nr_feature_create_flags(frame.create_flags);
     const FeatureKey key{
         working_width,
         working_height,
         working_width,
         working_height,
+        create_flags,
     };
     if (view.handle != nullptr && view.has_key && view.key == key) return true;
     if (view.feature_failed && view.has_key && view.key == key) return false;
@@ -553,7 +599,7 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
         )
     );
     parameters->Set("PerfQualityValue", 0U);
-    parameters->Set("DLSS.Feature.Create.Flags", frame.create_flags);
+    parameters->Set("DLSS.Feature.Create.Flags", create_flags);
     parameters->Set("CreationNodeMask", 1U);
     parameters->Set("VisibilityNodeMask", 1U);
 
@@ -580,7 +626,7 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
             working_height,
             working_width,
             working_height,
-            frame.create_flags,
+            create_flags,
             result
         );
         return false;
@@ -594,13 +640,14 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     view.settings_signature = 0U;
     trace_event(
         "DLSS-NR feature 18 created view=%llu input=%ux%u output=%ux%u "
-        "scale=%.2f flags=0x%X preset=%u",
+        "scale=%.2f flags=0x%X game_flags=0x%X preset=%u",
         static_cast<unsigned long long>(frame.view_id),
         working_width,
         working_height,
         working_width,
         working_height,
         1.0,
+        create_flags,
         frame.create_flags,
         preset
     );
@@ -630,6 +677,12 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
         release(device);
     };
     auto fail = [&](const char* const stage, const HRESULT result) noexcept {
+        if (shader_errors != nullptr && shader_errors->GetBufferPointer() != nullptr) {
+            trace_event(
+                "DLSS-NR shader errors %s",
+                static_cast<const char*>(shader_errors->GetBufferPointer())
+            );
+        }
         cleanup();
         release_gpu(gpu);
         diagnostics.state = DlssNrState::unsupported_resources;
@@ -824,36 +877,6 @@ float Luminance(float3 color) {
     return dot(color, float3(0.2126, 0.7152, 0.0722));
 }
 
-float SrgbEncodeChannel(float value) {
-    value = saturate(value);
-    return value <= 0.0031308
-        ? 12.92 * value
-        : 1.055 * pow(value, 1.0 / 2.4) - 0.055;
-}
-
-float3 SrgbEncode(float3 color) {
-    return float3(
-        SrgbEncodeChannel(color.r),
-        SrgbEncodeChannel(color.g),
-        SrgbEncodeChannel(color.b)
-    );
-}
-
-float SrgbDecodeChannel(float value) {
-    value = saturate(value);
-    return value <= 0.04045
-        ? value / 12.92
-        : pow((value + 0.055) / 1.055, 2.4);
-}
-
-float3 SrgbDecode(float3 color) {
-    return float3(
-        SrgbDecodeChannel(color.r),
-        SrgbDecodeChannel(color.g),
-        SrgbDecodeChannel(color.b)
-    );
-}
-
 float4 LoadSource0Bilinear(float2 position, uint2 origin, uint2 dimensions) {
     const float2 base = floor(position);
     const float2 fraction = position - base;
@@ -900,18 +923,30 @@ float4 LoadSource2Bilinear(float2 position, uint2 dimensions) {
     );
 }
 
-float3 UpgradeToneMap(float3 original, float3 proxy, float3 neural) {
-    float original_y = Luminance(original);
-    float proxy_y = Luminance(proxy);
-    float neural_y = Luminance(neural);
-    float ratio;
-    if (original_y < proxy_y) {
-        ratio = proxy_y > 0.0 ? original_y / proxy_y : 0.0;
-    } else {
-        float new_y = neural_y + max(0.0, original_y - proxy_y);
-        ratio = neural_y > 0.0 ? new_y / neural_y : 0.0;
-    }
-    return lerp(original, max(neural * ratio, 0.0), TransferStrength);
+float SampleLuma1(float2 position, uint2 dimensions) {
+    return Luminance(max(LoadSource1Bilinear(position, dimensions).rgb, 0.0));
+}
+
+float SampleLuma2(float2 position, uint2 dimensions) {
+    return Luminance(max(LoadSource2Bilinear(position, dimensions).rgb, 0.0));
+}
+
+float LocalLuma1(float2 position, uint2 dimensions) {
+    float sum = SampleLuma1(position, dimensions);
+    sum += SampleLuma1(position + float2(3.0, 0.0), dimensions);
+    sum += SampleLuma1(position + float2(-3.0, 0.0), dimensions);
+    sum += SampleLuma1(position + float2(0.0, 3.0), dimensions);
+    sum += SampleLuma1(position + float2(0.0, -3.0), dimensions);
+    return sum * 0.2;
+}
+
+float LocalLuma2(float2 position, uint2 dimensions) {
+    float sum = SampleLuma2(position, dimensions);
+    sum += SampleLuma2(position + float2(3.0, 0.0), dimensions);
+    sum += SampleLuma2(position + float2(-3.0, 0.0), dimensions);
+    sum += SampleLuma2(position + float2(0.0, 3.0), dimensions);
+    sum += SampleLuma2(position + float2(0.0, -3.0), dimensions);
+    return sum * 0.2;
 }
 
 [numthreads(16, 16, 1)]
@@ -929,12 +964,13 @@ void EncodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
             SourceBase,
             SourceSize
         );
-        const float3 linear_color = max(
-            proxy_source.rgb / max(PaperWhiteScale, 0.0001),
-            0.0
+        const float3 linear_color = max(proxy_source.rgb, 0.0);
+        const float luma = max(Luminance(linear_color), 1e-4);
+        const float compressed = luma / (1.0 + luma);
+        Output1[dispatch_id.xy] = float4(
+            linear_color * (compressed / luma),
+            1.0
         );
-        const float3 encoded = HdrMode != 0 ? SrgbEncode(linear_color) : linear_color;
-        Output1[dispatch_id.xy] = float4(encoded, proxy_source.a);
     }
 }
 
@@ -951,13 +987,6 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         abs(FoveationShapeDistance(float2(dispatch_id.xy) + float2(0.0, 1.0)) -
             distance_from_center)
     );
-    const bool alignment_border = ShowAlignmentBorder != 0U &&
-        inside_region && distance_from_center <= 1.0 &&
-        distance_from_center >= 1.0 - 5.0 * distance_per_pixel;
-    if (alignment_border) {
-        Output0[SourceBase + dispatch_id.xy] = float4(0.0, 1.0, 0.0, 1.0);
-        return;
-    }
     const float normalized_feather = FoveationFeather /
         max(0.0001, min(FoveationWidth, FoveationHeight));
     const float foveation_weight = FoveationFeather <= 0.0
@@ -976,21 +1005,54 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         float2(RegionSize) - 0.5;
     const float4 proxy_sample = LoadSource1Bilinear(proxy_position, ProxySize);
     const float4 neural_sample = LoadSource2Bilinear(proxy_position, ProxySize);
-    if (HdrMode == 0) {
-        const float4 processed = lerp(original_sample, neural_sample, ColorStrength);
-        Output0[SourceBase + dispatch_id.xy] = lerp(original_sample, processed, foveation_weight);
+    const bool neural_bad = any(neural_sample.rgb != neural_sample.rgb) ||
+        any(abs(neural_sample.rgb) > 65504.0);
+    const float original_y = Luminance(max(original_sample.rgb, 0.0));
+    const float proxy_y = Luminance(max(proxy_sample.rgb, 0.0));
+    const float neural_y = Luminance(max(neural_sample.rgb, 0.0));
+    const float local_proxy = LocalLuma1(proxy_position, ProxySize);
+    const float local_neural = LocalLuma2(proxy_position, ProxySize);
+    const bool neural_in_range = !neural_bad &&
+        original_y > 1e-5 && proxy_y > 1e-5 && neural_y > 1e-5 &&
+        abs(local_neural - local_proxy) < 0.12;
+    if (ShowAlignmentBorder != 0U) {
+        const float ring_y = max(original_y, 0.02);
+        if (distance_from_center <= 1.0 &&
+            distance_from_center >= 1.0 - 5.0 * distance_per_pixel) {
+            Output0[SourceBase + dispatch_id.xy] = float4(
+                original_sample.rgb * float3(0.05, 1.0, 0.05) +
+                    float3(0.0, ring_y * 3.0, 0.0),
+                1.0
+            );
+            return;
+        }
+        if (distance_from_center < 1.0 - 5.0 * distance_per_pixel &&
+            distance_from_center >= 1.0 - 10.0 * distance_per_pixel) {
+            const float3 tint = neural_in_range
+                ? float3(1.0, 1.0, 0.05)
+                : float3(1.0, 0.05, 1.0);
+            Output0[SourceBase + dispatch_id.xy] = float4(
+                original_sample.rgb * tint * 0.2 + tint * ring_y * 3.0,
+                1.0
+            );
+            return;
+        }
+    }
+    if (!neural_in_range) {
+        Output0[SourceBase + dispatch_id.xy] = original_sample;
         return;
     }
-    const float3 original = max(
-        original_sample.rgb / max(PaperWhiteScale, 0.0001),
-        0.0
+    const float proxy_hf = proxy_y - local_proxy;
+    const float neural_hf = neural_y - local_neural;
+    const float hf = clamp(neural_hf - proxy_hf, -0.06, 0.06);
+    const float orig_r = original_y / (1.0 + original_y);
+    const float new_r = saturate(
+        orig_r + hf * saturate(ColorStrength) * foveation_weight
     );
-    const float3 proxy = SrgbDecode(proxy_sample.rgb);
-    const float3 neural = SrgbDecode(neural_sample.rgb);
-    const float3 upgraded = UpgradeToneMap(original, proxy, neural);
-    const float3 decoded = lerp(original, upgraded, ColorStrength) * PaperWhiteScale;
-    const float4 processed = float4(max(decoded, 0.0), original_sample.a);
-    Output0[SourceBase + dispatch_id.xy] = lerp(original_sample, processed, foveation_weight);
+    const float new_y = new_r / max(1.0 - new_r, 1e-4);
+    const float3 processed =
+        original_sample.rgb * (new_y / max(original_y, 1e-4));
+    Output0[SourceBase + dispatch_id.xy] = float4(processed, original_sample.a);
 }
 )";
 
@@ -1039,13 +1101,15 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
     if (FAILED(result)) return fail("CreateComputePipelineState(decode)", result);
     cleanup();
     trace_event(
-        "DLSS-NR region codec created region=%ux%u working=%ux%u source=%u,%u",
+        "DLSS-NR region codec created region=%ux%u working=%ux%u source=%u,%u "
+        "format=0x%X",
         gpu.width,
         gpu.height,
         gpu.working_width,
         gpu.working_height,
         region.base_x,
-        region.base_y
+        region.base_y,
+        static_cast<unsigned>(game_desc.Format)
     );
     return true;
 }
@@ -1332,6 +1396,92 @@ void uav_barrier(
     command_list->ResourceBarrier(1U, &barrier);
 }
 
+void copy_texture_region(
+    ID3D12GraphicsCommandList* const command_list,
+    ID3D12Resource* const destination,
+    const std::uint32_t dest_x,
+    const std::uint32_t dest_y,
+    ID3D12Resource* const source,
+    const std::uint32_t src_x,
+    const std::uint32_t src_y,
+    const std::uint32_t width,
+    const std::uint32_t height
+) noexcept {
+    D3D12_TEXTURE_COPY_LOCATION dest_location{};
+    dest_location.pResource = destination;
+    dest_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dest_location.SubresourceIndex = 0U;
+    D3D12_TEXTURE_COPY_LOCATION source_location{};
+    source_location.pResource = source;
+    source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    source_location.SubresourceIndex = 0U;
+    D3D12_BOX box{};
+    box.left = src_x;
+    box.top = src_y;
+    box.front = 0U;
+    box.right = src_x + width;
+    box.bottom = src_y + height;
+    box.back = 1U;
+    command_list->CopyTextureRegion(
+        &dest_location, dest_x, dest_y, 0U, &source_location, &box
+    );
+}
+
+[[nodiscard]] bool ensure_input_scratch(
+    ViewState& view,
+    ID3D12Device* const device,
+    const std::uint32_t width,
+    const std::uint32_t height,
+    const DXGI_FORMAT format
+) noexcept {
+    if (view.input_scratch != nullptr &&
+        view.scratch_width == width &&
+        view.scratch_height == height &&
+        view.scratch_format == format) {
+        return true;
+    }
+    release(view.input_scratch);
+    view.scratch_width = 0U;
+    view.scratch_height = 0U;
+    view.scratch_format = DXGI_FORMAT_UNKNOWN;
+    if (device == nullptr || width == 0U || height == 0U) return false;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap.CreationNodeMask = 1U;
+    heap.VisibleNodeMask = 1U;
+    D3D12_RESOURCE_DESC texture{};
+    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture.Width = width;
+    texture.Height = height;
+    texture.DepthOrArraySize = 1U;
+    texture.MipLevels = 1U;
+    texture.Format = format;
+    texture.SampleDesc.Count = 1U;
+    texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    const auto result = device->CreateCommittedResource(
+        &heap,
+        D3D12_HEAP_FLAG_NONE,
+        &texture,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        nullptr,
+        IID_PPV_ARGS(&view.input_scratch)
+    );
+    if (FAILED(result)) {
+        trace_event(
+            "NR before SR scratch create failed hr=0x%08X format=%u %ux%u",
+            static_cast<unsigned>(result),
+            static_cast<unsigned>(format),
+            width,
+            height
+        );
+        return false;
+    }
+    view.scratch_width = width;
+    view.scratch_height = height;
+    view.scratch_format = format;
+    return true;
+}
+
 void dispatch_codec(
     const DlssNrFrame& frame,
     GpuResources& gpu,
@@ -1339,7 +1489,8 @@ void dispatch_codec(
     const std::uint32_t source_descriptor,
     const std::uint32_t destination_descriptor,
     const Settings& settings,
-    const NrRegion& region
+    const NrRegion& region,
+    const std::uint32_t hdr_mode
 ) noexcept {
     ID3D12DescriptorHeap* heaps[]{gpu.descriptors};
     frame.command_list->SetDescriptorHeaps(1U, heaps);
@@ -1379,7 +1530,7 @@ void dispatch_codec(
         settings.nr_paper_white_scale,
         settings.nr_hdr_transfer_strength,
         settings.nr_color_strength,
-        1U,
+        hdr_mode,
         {0U, 0U},
         {gpu.width, gpu.height},
         region.shape_width,
@@ -1396,6 +1547,296 @@ void dispatch_codec(
         (dispatch_height + 15U) / 16U,
         1U
     );
+}
+
+constexpr std::uint32_t color_sample_points = 5U;
+constexpr std::uint32_t color_sample_buffers = 3U;
+constexpr std::uint32_t color_sample_pitch = 256U;
+
+[[nodiscard]] bool should_record_color_samples() noexcept {
+    static std::atomic<std::uint32_t> sequence{};
+    const auto sample = sequence.fetch_add(1U, std::memory_order_relaxed);
+    return sample < 8U || sample % 150U == 0U;
+}
+
+[[nodiscard]] bool ensure_sample_readback(
+    ViewState& view,
+    ID3D12Device* const device
+) noexcept {
+    if (view.sample_readback != nullptr) return true;
+    if (device == nullptr) return false;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    heap.CreationNodeMask = 1U;
+    heap.VisibleNodeMask = 1U;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = static_cast<std::uint64_t>(color_sample_points) *
+        color_sample_buffers * color_sample_pitch;
+    desc.Height = 1U;
+    desc.DepthOrArraySize = 1U;
+    desc.MipLevels = 1U;
+    desc.SampleDesc.Count = 1U;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    const auto result = device->CreateCommittedResource(
+        &heap,
+        D3D12_HEAP_FLAG_NONE,
+        &desc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(&view.sample_readback)
+    );
+    return SUCCEEDED(result) && view.sample_readback != nullptr;
+}
+
+void copy_color_sample_pixel(
+    ID3D12GraphicsCommandList* const command_list,
+    ID3D12Resource* const readback,
+    const std::uint32_t slot,
+    ID3D12Resource* const source,
+    const std::uint32_t x,
+    const std::uint32_t y
+) noexcept {
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = readback;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint.Offset =
+        static_cast<std::uint64_t>(slot) * color_sample_pitch;
+    destination.PlacedFootprint.Footprint.Format =
+        DXGI_FORMAT_R16G16B16A16_FLOAT;
+    destination.PlacedFootprint.Footprint.Width = 1U;
+    destination.PlacedFootprint.Footprint.Height = 1U;
+    destination.PlacedFootprint.Footprint.Depth = 1U;
+    destination.PlacedFootprint.Footprint.RowPitch = color_sample_pitch;
+    D3D12_TEXTURE_COPY_LOCATION source_location{};
+    source_location.pResource = source;
+    source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    source_location.SubresourceIndex = 0U;
+    D3D12_BOX box{};
+    box.left = x;
+    box.top = y;
+    box.front = 0U;
+    box.right = x + 1U;
+    box.bottom = y + 1U;
+    box.back = 1U;
+    command_list->CopyTextureRegion(
+        &destination, 0U, 0U, 0U, &source_location, &box
+    );
+}
+
+void record_color_samples(
+    ViewState& view,
+    GpuResources& gpu,
+    ID3D12GraphicsCommandList* const command_list,
+    const Settings& settings,
+    const DXGI_FORMAT color_format
+) noexcept {
+    if (!should_record_color_samples() || command_list == nullptr) return;
+    if (!ensure_sample_readback(view, runtime.device)) return;
+    const std::uint32_t crop_w = (std::max)(1U, gpu.width);
+    const std::uint32_t crop_h = (std::max)(1U, gpu.height);
+    const std::uint32_t proxy_w = (std::max)(1U, gpu.working_width);
+    const std::uint32_t proxy_h = (std::max)(1U, gpu.working_height);
+    const float u[color_sample_points]{0.15F, 0.85F, 0.50F, 0.15F, 0.85F};
+    const float v[color_sample_points]{0.15F, 0.15F, 0.50F, 0.85F, 0.85F};
+    auto sample_x = [](const float coord, const std::uint32_t extent) noexcept {
+        const auto max_index = extent > 0U ? extent - 1U : 0U;
+        return (std::min)(
+            max_index,
+            static_cast<std::uint32_t>(coord * static_cast<float>(max_index) + 0.5F)
+        );
+    };
+    transition(
+        command_list, gpu.original_output,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_COPY_SOURCE
+    );
+    transition(
+        command_list, gpu.color_proxy,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_COPY_SOURCE
+    );
+    transition(
+        command_list, gpu.neural_output,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_SOURCE
+    );
+    ID3D12Resource* const sources[color_sample_buffers]{
+        gpu.original_output, gpu.color_proxy, gpu.neural_output
+    };
+    const std::uint32_t widths[color_sample_buffers]{crop_w, proxy_w, proxy_w};
+    const std::uint32_t heights[color_sample_buffers]{crop_h, proxy_h, proxy_h};
+    for (std::uint32_t point = 0U; point < color_sample_points; ++point) {
+        for (std::uint32_t buffer = 0U; buffer < color_sample_buffers; ++buffer) {
+            copy_color_sample_pixel(
+                command_list,
+                view.sample_readback,
+                point * color_sample_buffers + buffer,
+                sources[buffer],
+                sample_x(u[point], widths[buffer]),
+                sample_x(v[point], heights[buffer])
+            );
+        }
+    }
+    transition(
+        command_list, gpu.original_output,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+    );
+    transition(
+        command_list, gpu.color_proxy,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+    );
+    transition(
+        command_list, gpu.neural_output,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    );
+    view.sample_crop_width = crop_w;
+    view.sample_crop_height = crop_h;
+    view.sample_proxy_width = proxy_w;
+    view.sample_proxy_height = proxy_h;
+    view.sample_format = static_cast<std::uint32_t>(color_format);
+    view.sample_paper_white = settings.nr_paper_white_scale;
+    view.samples_pending = true;
+}
+
+[[nodiscard]] float fp16_to_float(const std::uint16_t value) noexcept {
+    const std::uint32_t sign = static_cast<std::uint32_t>(value & 0x8000U) << 16U;
+    const std::uint32_t exponent = (value >> 10U) & 0x1FU;
+    const std::uint32_t mantissa = value & 0x3FFU;
+    std::uint32_t bits = sign;
+    if (exponent == 0U) {
+        if (mantissa != 0U) {
+            std::uint32_t mag = mantissa;
+            std::uint32_t exp = 127U - 15U + 1U;
+            while ((mag & 0x400U) == 0U) {
+                mag <<= 1U;
+                --exp;
+            }
+            bits |= (exp << 23U) | ((mag & 0x3FFU) << 13U);
+        }
+    } else if (exponent == 31U) {
+        bits |= 0x7F800000U | (mantissa << 13U);
+    } else {
+        bits |= ((exponent + (127U - 15U)) << 23U) | (mantissa << 13U);
+    }
+    float result{};
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+void log_pending_color_samples(ViewState& view) noexcept {
+    if (!view.samples_pending || view.sample_readback == nullptr) return;
+    const auto size = static_cast<std::uint64_t>(color_sample_points) *
+        color_sample_buffers * color_sample_pitch;
+    D3D12_RANGE range{0U, size};
+    void* mapped{};
+    if (FAILED(view.sample_readback->Map(0U, &range, &mapped)) ||
+        mapped == nullptr) {
+        view.samples_pending = false;
+        return;
+    }
+    struct BufferStats {
+        float luma_min{1.0e30F};
+        float luma_max{-1.0e30F};
+        float luma_sum{};
+        float max_abs{};
+        float center_r{};
+        float center_g{};
+        float center_b{};
+        std::uint32_t nan_count{};
+        std::uint32_t inf_count{};
+        std::uint32_t finite_count{};
+    };
+    BufferStats stats[color_sample_buffers]{};
+    const auto* const bytes = static_cast<const std::uint8_t*>(mapped);
+    for (std::uint32_t point = 0U; point < color_sample_points; ++point) {
+        for (std::uint32_t buffer = 0U; buffer < color_sample_buffers; ++buffer) {
+            const auto slot = point * color_sample_buffers + buffer;
+            const auto* const pixel = reinterpret_cast<const std::uint16_t*>(
+                bytes + static_cast<std::size_t>(slot) * color_sample_pitch
+            );
+            const float rgb[3]{
+                fp16_to_float(pixel[0]),
+                fp16_to_float(pixel[1]),
+                fp16_to_float(pixel[2])
+            };
+            auto& stat = stats[buffer];
+            const bool bad =
+                rgb[0] != rgb[0] || rgb[1] != rgb[1] || rgb[2] != rgb[2];
+            const bool inf =
+                std::isinf(rgb[0]) || std::isinf(rgb[1]) || std::isinf(rgb[2]);
+            if (bad) {
+                ++stat.nan_count;
+                continue;
+            }
+            if (inf) {
+                ++stat.inf_count;
+                continue;
+            }
+            ++stat.finite_count;
+            const float luma =
+                rgb[0] * 0.2126F + rgb[1] * 0.7152F + rgb[2] * 0.0722F;
+            stat.luma_min = (std::min)(stat.luma_min, luma);
+            stat.luma_max = (std::max)(stat.luma_max, luma);
+            stat.luma_sum += luma;
+            stat.max_abs = (std::max)(
+                stat.max_abs,
+                (std::max)(std::fabs(rgb[0]), (std::max)(std::fabs(rgb[1]), std::fabs(rgb[2])))
+            );
+            if (point == 2U) {
+                stat.center_r = rgb[0];
+                stat.center_g = rgb[1];
+                stat.center_b = rgb[2];
+            }
+        }
+    }
+    D3D12_RANGE empty{};
+    view.sample_readback->Unmap(0U, &empty);
+    view.samples_pending = false;
+    const auto describe = [](const BufferStats& stat) noexcept {
+        if (stat.finite_count == 0U) return "empty";
+        if (stat.max_abs < 1.0e-6F) return "cleared";
+        if (stat.luma_max <= 1.2F) return "gamma-or-display-1";
+        if (stat.luma_max <= 16.0F) return "linear-paper-white";
+        return "scene-referred-or-scaled";
+    };
+    const char* names[color_sample_buffers]{"original", "proxy", "neural"};
+    trace_event(
+        "DLSS-NR color samples hdr_mode=0 paper_white=%.3f format=0x%X "
+        "crop=%ux%u proxy=%ux%u",
+        view.sample_paper_white,
+        view.sample_format,
+        view.sample_crop_width,
+        view.sample_crop_height,
+        view.sample_proxy_width,
+        view.sample_proxy_height
+    );
+    for (std::uint32_t buffer = 0U; buffer < color_sample_buffers; ++buffer) {
+        const auto& stat = stats[buffer];
+        const auto mean = stat.finite_count == 0U
+            ? 0.0F
+            : stat.luma_sum / static_cast<float>(stat.finite_count);
+        const auto luma_min = stat.finite_count == 0U ? 0.0F : stat.luma_min;
+        const auto luma_max = stat.finite_count == 0U ? 0.0F : stat.luma_max;
+        trace_event(
+            "DLSS-NR %s luma min=%.4g max=%.4g mean=%.4g maxAbs=%.4g "
+            "center=%.4g,%.4g,%.4g nan=%u inf=%u hint=%s",
+            names[buffer],
+            luma_min,
+            luma_max,
+            mean,
+            stat.max_abs,
+            stat.center_r,
+            stat.center_g,
+            stat.center_b,
+            stat.nan_count,
+            stat.inf_count,
+            describe(stat)
+        );
+    }
 }
 
 }  // namespace
@@ -1455,33 +1896,61 @@ bool evaluate_dlss_nr(
     const Settings& settings
 ) noexcept {
     Settings nr_settings = settings;
-    const auto eye_base_x = frame.color_is_region ? 0U : frame.color_base_x;
-    const auto eye_base_y = frame.color_is_region ? 0U : frame.color_base_y;
-    std::uint32_t travel_width = frame.output_width;
-    std::uint32_t travel_height = frame.output_height;
+    if (frame.after_polish) {
+        apply_nr_after_polish(nr_settings);
+    }
+    std::uint32_t color_width = 0U;
+    std::uint32_t color_height = 0U;
     if (frame.color != nullptr) {
         const auto color_desc = frame.color->GetDesc();
-        travel_width = (std::max)(
-            frame.output_width, static_cast<std::uint32_t>(color_desc.Width)
+        color_width = static_cast<std::uint32_t>(color_desc.Width);
+        color_height = color_desc.Height;
+    }
+    std::uint32_t view_width = frame.output_width;
+    std::uint32_t view_height = frame.output_height;
+    std::uint32_t travel_width = view_width;
+    std::uint32_t travel_height = view_height;
+    if (frame.pre_upscale) {
+        const auto canvas = dlss_nr_pre_upscale_canvas(
+            frame.input_width,
+            frame.input_height,
+            frame.output_width,
+            frame.output_height,
+            color_width,
+            color_height
         );
-        travel_height = (std::max)(
-            frame.output_height, static_cast<std::uint32_t>(color_desc.Height)
-        );
+        view_width = frame.input_width;
+        view_height = frame.input_height;
+        travel_width = canvas.travel_width;
+        travel_height = canvas.travel_height;
+    } else if (color_width != 0U) {
+        travel_width = (std::max)(view_width, color_width);
+        travel_height = (std::max)(view_height, color_height);
+    }
+    const auto eye_base_x = frame.color_is_region ? 0U : frame.color_base_x;
+    const auto eye_base_y = frame.color_is_region ? 0U : frame.color_base_y;
+    if (frame.color != nullptr) {
         apply_openxr_gaze_to_nr_settings(
             nr_settings,
             frame.view_id,
             frame.color,
             eye_base_x,
             eye_base_y,
-            frame.output_width,
-            frame.output_height,
+            view_width,
+            view_height,
             travel_width,
             travel_height,
             true
         );
     }
-    std::unique_lock lock(nr_mutex, std::try_to_lock);
-    if (!lock.owns_lock()) return false;
+    if (frame.pre_upscale && frame.output_width != 0U &&
+        frame.output_height != 0U) {
+        nr_settings.nr_source_x *= static_cast<float>(frame.input_width) /
+            static_cast<float>(frame.output_width);
+        nr_settings.nr_source_y *= static_cast<float>(frame.input_height) /
+            static_cast<float>(frame.output_height);
+    }
+    std::unique_lock lock(nr_mutex);
     diagnostics.route = frame.route;
     if (!settings.nr_enabled) {
         diagnostics.state = DlssNrState::disabled;
@@ -1498,6 +1967,22 @@ bool evaluate_dlss_nr(
         frame.motion_height == 0U) {
         diagnostics.state = DlssNrState::unsupported_resources;
         ++diagnostics.failed_calls;
+        trace_event(
+            "DLSS-NR missing resources view=%llu color=%p depth=%p mv=%p "
+            "input=%ux%u output=%ux%u depth=%ux%u mv=%ux%u",
+            static_cast<unsigned long long>(frame.view_id),
+            frame.color,
+            frame.depth,
+            frame.motion_vectors,
+            frame.input_width,
+            frame.input_height,
+            frame.output_width,
+            frame.output_height,
+            frame.depth_width,
+            frame.depth_height,
+            frame.motion_width,
+            frame.motion_height
+        );
         return false;
     }
     ID3D12Device* device{};
@@ -1508,7 +1993,8 @@ bool evaluate_dlss_nr(
         ++diagnostics.failed_calls;
         return false;
     }
-    const bool runtime_ready = runtime.state == 1U && runtime.device == device;
+    const bool runtime_ready =
+        runtime.state == 1U && same_d3d12_device(runtime.device, device);
     if (!runtime_ready) {
         if (pending_device != device) {
             if (pending_device != nullptr) pending_device->Release();
@@ -1516,24 +2002,42 @@ bool evaluate_dlss_nr(
             pending_device->AddRef();
         }
         device->Release();
+        const auto waits = diagnostics.failed_calls;
+        if (waits < 8U || waits % 300U == 0U) {
+            trace_event(
+                "DLSS-NR waiting for runtime host_evaluate=%s pending=%p "
+                "state=%u",
+                host_evaluate_succeeded.load(std::memory_order_acquire)
+                    ? "yes"
+                    : "no",
+                pending_device,
+                runtime.state
+            );
+        }
+        ++diagnostics.failed_calls;
         return false;
     }
-    device->Release();
 
-    const auto color_desc = frame.color->GetDesc();
+    DlssNrFrame work = frame;
+    if (work.pre_upscale) {
+        work.view_id ^= 0xA11AF0E500000001ULL;
+    } else if (work.after_polish) {
+        work.view_id ^= 0xA11AF0E500000002ULL;
+    }
+    const auto color_desc = work.color->GetDesc();
     auto region = calculate_region(
         nr_settings,
-        frame.output_width,
-        frame.output_height,
-        frame.has_shared_sr_crop ? &frame.shared_sr_crop : nullptr,
-        frame.input_width,
-        frame.input_height,
+        view_width,
+        view_height,
+        work.has_shared_sr_crop ? &work.shared_sr_crop : nullptr,
+        work.input_width,
+        work.input_height,
         travel_width,
         travel_height,
         eye_base_x,
         eye_base_y
     );
-    auto& view = find_or_create_view(frame.view_id);
+    auto& view = find_or_create_view(work.view_id);
     const auto stabilize = [](
         const std::uint32_t requested,
         const std::uint32_t previous,
@@ -1548,18 +2052,30 @@ bool evaluate_dlss_nr(
     region.height = stabilize(
         region.height, view.key.input_height, view.has_key
     );
-    if (region.base_x + region.width > travel_width) {
-        region.base_x = travel_width > region.width
-            ? (travel_width - region.width) / 8U * 8U : 0U;
-        if (region.base_x + region.width > travel_width) {
-            region.width = travel_width / 8U * 8U;
+    const auto canvas_width = work.pre_upscale
+        ? (std::min)(
+            static_cast<std::uint32_t>(color_desc.Width),
+            work.color_base_x + travel_width
+        )
+        : travel_width;
+    const auto canvas_height = work.pre_upscale
+        ? (std::min)(
+            static_cast<std::uint32_t>(color_desc.Height),
+            work.color_base_y + travel_height
+        )
+        : travel_height;
+    if (region.base_x + region.width > canvas_width) {
+        region.base_x = canvas_width > region.width
+            ? (canvas_width - region.width) / 8U * 8U : 0U;
+        if (region.base_x + region.width > canvas_width) {
+            region.width = canvas_width / 8U * 8U;
         }
     }
-    if (region.base_y + region.height > travel_height) {
-        region.base_y = travel_height > region.height
-            ? (travel_height - region.height) / 8U * 8U : 0U;
-        if (region.base_y + region.height > travel_height) {
-            region.height = travel_height / 8U * 8U;
+    if (region.base_y + region.height > canvas_height) {
+        region.base_y = canvas_height > region.height
+            ? (canvas_height - region.height) / 8U * 8U : 0U;
+        if (region.base_y + region.height > canvas_height) {
+            region.height = canvas_height / 8U * 8U;
         }
     }
     if (!view.logged_crop ||
@@ -1573,13 +2089,15 @@ bool evaluate_dlss_nr(
         view.logged_crop_w = region.width;
         view.logged_crop_h = region.height;
         const auto displayed = dlss_nr_displayed_view(
-            frame.output_width,
-            frame.output_height,
+            view_width,
+            view_height,
             travel_width,
             travel_height
         );
         trace_event(
-            "NR crop view=%llu origin=%u,%u size=%ux%u of %ux%u stereoX=%.3f source=%.0f,%.0f",
+            "NR crop view=%llu origin=%u,%u size=%ux%u of %ux%u stereoX=%.3f "
+            "source=%.0f,%.0f pre_upscale=%s polish=%s input=%ux%u output=%ux%u "
+            "colorTex=%ux%u colorBase=%u,%u outputBase=%u,%u",
             static_cast<unsigned long long>(frame.view_id),
             region.base_x,
             region.base_y,
@@ -1589,66 +2107,170 @@ bool evaluate_dlss_nr(
             displayed.height,
             settings.nr_x_offset,
             settings.nr_source_x,
-            settings.nr_source_y
+            settings.nr_source_y,
+            work.pre_upscale ? "yes" : "no",
+            work.after_polish ? "yes" : "no",
+            work.input_width,
+            work.input_height,
+            work.output_width,
+            work.output_height,
+            static_cast<std::uint32_t>(color_desc.Width),
+            static_cast<std::uint32_t>(color_desc.Height),
+            work.color_base_x,
+            work.color_base_y,
+            work.output_base_x,
+            work.output_base_y
         );
     }
+    // Transport already copied the NR crop into a 0,0-based texture. Do not
+    // nest another foveation crop inside that patch (that shifted left).
+    if (work.color_is_region) {
+        region.base_x = 0U;
+        region.base_y = 0U;
+        region.width = static_cast<std::uint32_t>(color_desc.Width);
+        region.height = color_desc.Height;
+        region.shape_width = 1.0F;
+        region.shape_height = 1.0F;
+    }
+    ID3D12Resource* game_color = work.color;
+    const auto game_color_state = work.color_state;
+    const auto crop_src_x = region.base_x;
+    const auto crop_src_y = region.base_y;
+    bool copied_input = false;
+    const bool color_has_uav =
+        (color_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+    if (work.pre_upscale && !work.color_is_region && !color_has_uav) {
+        if (!ensure_input_scratch(
+                view, device, region.width, region.height, color_desc.Format
+            )) {
+            device->Release();
+            diagnostics.state = DlssNrState::unsupported_resources;
+            ++diagnostics.failed_calls;
+            return false;
+        }
+        const auto local_x = region.base_x > work.color_base_x
+            ? region.base_x - work.color_base_x : 0U;
+        const auto local_y = region.base_y > work.color_base_y
+            ? region.base_y - work.color_base_y : 0U;
+        transition(
+            work.command_list, game_color, game_color_state,
+            D3D12_RESOURCE_STATE_COPY_SOURCE
+        );
+        transition(
+            work.command_list, view.input_scratch,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_DEST
+        );
+        copy_texture_region(
+            work.command_list, view.input_scratch, 0U, 0U,
+            game_color, crop_src_x, crop_src_y, region.width, region.height
+        );
+        transition(
+            work.command_list, view.input_scratch,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        );
+        work.color = view.input_scratch;
+        work.color_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        work.color_is_region = true;
+        work.color_base_x = 0U;
+        work.color_base_y = 0U;
+        work.depth_base_x += local_x;
+        work.depth_base_y += local_y;
+        work.depth_width = region.width;
+        work.depth_height = region.height;
+        work.motion_base_x += local_x;
+        work.motion_base_y += local_y;
+        work.motion_width = region.width;
+        work.motion_height = region.height;
+        region.base_x = 0U;
+        region.base_y = 0U;
+        copied_input = true;
+    }
+    device->Release();
     const auto working_width = scaled_extent(region.width, nr_settings.nr_working_scale);
     const auto working_height = scaled_extent(region.height, nr_settings.nr_working_scale);
     NrRegion codec_region = region;
-    if (codec_region.base_x + codec_region.width > color_desc.Width ||
-        codec_region.base_y + codec_region.height > color_desc.Height) {
+    const auto nr_color_desc = work.color->GetDesc();
+    if (codec_region.base_x + codec_region.width > nr_color_desc.Width ||
+        codec_region.base_y + codec_region.height > nr_color_desc.Height) {
         diagnostics.state = DlssNrState::unsupported_resources;
         ++diagnostics.failed_calls;
+        trace_event(
+            "NR crop exceeds color texture region=%u,%u %ux%u color=%ux%u "
+            "color_is_region=%s",
+            codec_region.base_x,
+            codec_region.base_y,
+            codec_region.width,
+            codec_region.height,
+            static_cast<std::uint32_t>(nr_color_desc.Width),
+            static_cast<std::uint32_t>(nr_color_desc.Height),
+            work.color_is_region ? "yes" : "no"
+        );
         return false;
     }
-    if (!create_feature(view, frame, settings, working_width, working_height)) {
+    if (!create_feature(view, work, settings, working_width, working_height)) {
+        if (copied_input) {
+            transition(
+                work.command_list, game_color,
+                D3D12_RESOURCE_STATE_COPY_SOURCE, game_color_state
+            );
+        }
         return false;
     }
     auto* const gpu = find_or_create_gpu(
         view,
-        frame,
+        work,
         codec_region,
         working_width,
         working_height
     );
-    if (gpu == nullptr) return false;
+    if (gpu == nullptr) {
+        if (copied_input) {
+            transition(
+                work.command_list, game_color,
+                D3D12_RESOURCE_STATE_COPY_SOURCE, game_color_state
+            );
+        }
+        return false;
+    }
     const auto local_x = region.base_x > eye_base_x ? region.base_x - eye_base_x : 0U;
     const auto local_y = region.base_y > eye_base_y ? region.base_y - eye_base_y : 0U;
-    const auto depth_x = frame.color_is_region
-        ? ScaledSubrect{frame.depth_base_x, frame.depth_width}
+    const auto depth_x = work.color_is_region
+        ? ScaledSubrect{work.depth_base_x, work.depth_width}
         : scale_subrect(
             local_x,
             region.width,
-            frame.depth_base_x,
-            frame.depth_width,
-            frame.output_width
+            work.depth_base_x,
+            work.depth_width,
+            work.output_width
         );
-    const auto depth_y = frame.color_is_region
-        ? ScaledSubrect{frame.depth_base_y, frame.depth_height}
+    const auto depth_y = work.color_is_region
+        ? ScaledSubrect{work.depth_base_y, work.depth_height}
         : scale_subrect(
             local_y,
             region.height,
-            frame.depth_base_y,
-            frame.depth_height,
-            frame.output_height
+            work.depth_base_y,
+            work.depth_height,
+            work.output_height
         );
-    const auto motion_x = frame.color_is_region
-        ? ScaledSubrect{frame.motion_base_x, frame.motion_width}
+    const auto motion_x = work.color_is_region
+        ? ScaledSubrect{work.motion_base_x, work.motion_width}
         : scale_subrect(
             local_x,
             region.width,
-            frame.motion_base_x,
-            frame.motion_width,
-            frame.output_width
+            work.motion_base_x,
+            work.motion_width,
+            work.output_width
         );
-    const auto motion_y = frame.color_is_region
-        ? ScaledSubrect{frame.motion_base_y, frame.motion_height}
+    const auto motion_y = work.color_is_region
+        ? ScaledSubrect{work.motion_base_y, work.motion_height}
         : scale_subrect(
             local_y,
             region.height,
-            frame.motion_base_y,
-            frame.motion_height,
-            frame.output_height
+            work.motion_base_y,
+            work.motion_height,
+            work.output_height
         );
 
     auto* const parameters = view.parameters;
@@ -1656,48 +2278,55 @@ bool evaluate_dlss_nr(
     const auto reset_generation = requested_reset_generation.load(
         std::memory_order_acquire
     );
-    const bool reset = frame.reset || !view.was_enabled ||
+    const bool reset = work.reset || !view.was_enabled ||
         view.settings_signature != signature ||
         view.reset_generation != reset_generation;
     view.was_enabled = true;
     view.settings_signature = signature;
     view.reset_generation = reset_generation;
 
-    uav_barrier(frame.command_list, frame.color);
+    uav_barrier(work.command_list, work.color);
     transition(
-        frame.command_list,
-        frame.color,
-        frame.color_state,
+        work.command_list,
+        work.color,
+        work.color_state,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
     );
+    constexpr std::uint32_t hdr_mode = 0U;
     dispatch_codec(
-        frame,
+        work,
         *gpu,
         gpu->encode_pipeline,
         0U,
         4U,
         settings,
-        codec_region
+        codec_region,
+        hdr_mode
     );
-    uav_barrier(frame.command_list, gpu->original_output);
-    uav_barrier(frame.command_list, gpu->color_proxy);
+    uav_barrier(work.command_list, gpu->original_output);
+    uav_barrier(work.command_list, gpu->color_proxy);
     transition(
-        frame.command_list,
+        work.command_list,
         gpu->original_output,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
     );
     transition(
-        frame.command_list,
+        work.command_list,
         gpu->color_proxy,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
     );
 
+    parameters->Set("Color", gpu->color_proxy);
+    parameters->Set("Output", gpu->neural_output);
+    parameters->Set("Depth", work.depth);
+    parameters->Set("MotionVectors", work.motion_vectors);
     parameters->Set("DLSSNR.Color", gpu->color_proxy);
     parameters->Set("DLSSNR.Output", gpu->neural_output);
-    parameters->Set("DLSSNR.MVec", frame.motion_vectors);
-    parameters->Set("DLSSNR.Depth", frame.depth);
+    parameters->Set("DLSSNR.Backbuffer", gpu->color_proxy);
+    parameters->Set("DLSSNR.MVec", work.motion_vectors);
+    parameters->Set("DLSSNR.Depth", work.depth);
     parameters->Set("DLSSNR.ColorSubrectBaseX", 0U);
     parameters->Set("DLSSNR.ColorSubrectBaseY", 0U);
     parameters->Set("DLSSNR.ColorSubrectWidth", working_width);
@@ -1706,6 +2335,10 @@ bool evaluate_dlss_nr(
     parameters->Set("DLSSNR.OutputSubrectBaseY", 0U);
     parameters->Set("DLSSNR.OutputSubrectWidth", working_width);
     parameters->Set("DLSSNR.OutputSubrectHeight", working_height);
+    parameters->Set("DLSSNR.BackbufferSubrectBaseX", 0U);
+    parameters->Set("DLSSNR.BackbufferSubrectBaseY", 0U);
+    parameters->Set("DLSSNR.BackbufferSubrectWidth", working_width);
+    parameters->Set("DLSSNR.BackbufferSubrectHeight", working_height);
     parameters->Set("DLSSNR.DepthSubrectBaseX", depth_x.base);
     parameters->Set("DLSSNR.DepthSubrectBaseY", depth_y.base);
     parameters->Set("DLSSNR.DepthSubrectWidth", depth_x.extent);
@@ -1716,20 +2349,24 @@ bool evaluate_dlss_nr(
     parameters->Set("DLSSNR.MVecSubrectHeight", motion_y.extent);
     parameters->Set(
         "DLSSNR.MVecScaleX",
-        frame.motion_scale_x * settings.nr_motion_scale_x_multiplier *
+        work.motion_scale_x * settings.nr_motion_scale_x_multiplier *
             static_cast<float>(working_width) / region.width
     );
     parameters->Set(
         "DLSSNR.MVecScaleY",
-        frame.motion_scale_y * settings.nr_motion_scale_y_multiplier *
+        work.motion_scale_y * settings.nr_motion_scale_y_multiplier *
             static_cast<float>(working_height) / region.height
     );
     const bool depth_inverted = settings.nr_depth_convention == 1U
         ? false
-        : settings.nr_depth_convention == 2U ? true : frame.depth_inverted;
+        : settings.nr_depth_convention == 2U ? true : work.depth_inverted;
     parameters->Set("DLSSNR.DepthInverted", depth_inverted ? 1U : 0U);
     parameters->Set("DLSSNR.Enabled", 1U);
     parameters->Set("DLSSNR.Reset", reset ? 1U : 0U);
+    parameters->Set("Jitter.Offset.X", work.jitter_x);
+    parameters->Set("Jitter.Offset.Y", work.jitter_y);
+    parameters->Set("DLSSNR.JitterX", work.jitter_x);
+    parameters->Set("DLSSNR.JitterY", work.jitter_y);
     parameters->Set("DLSSNR.ScalingRatio", 1.0F);
     parameters->Set("DLSSNR.Scale", 1.0F);
     parameters->Set("DLSSNR.Upscaling", 0U);
@@ -1748,26 +2385,26 @@ bool evaluate_dlss_nr(
     parameters->Set("DLSSNR.UICorrection", settings.nr_ui_correction ? 1U : 0U);
 
     const auto result = runtime.evaluate_feature(
-        frame.command_list,
+        work.command_list,
         view.handle,
         parameters,
         nullptr
     );
     diagnostics.last_result = result;
-    diagnostics.output_width = frame.output_width;
-    diagnostics.output_height = frame.output_height;
+    diagnostics.output_width = work.output_width;
+    diagnostics.output_height = work.output_height;
     diagnostics.color_width = static_cast<std::uint32_t>(color_desc.Width);
     diagnostics.color_height = static_cast<std::uint32_t>(color_desc.Height);
     const auto displayed_view = dlss_nr_displayed_view(
-        frame.output_width,
-        frame.output_height,
+        view_width,
+        view_height,
         travel_width,
         travel_height
     );
     diagnostics.view_width = displayed_view.width;
     diagnostics.view_height = displayed_view.height;
-    diagnostics.region_base_x = region.base_x;
-    diagnostics.region_base_y = region.base_y;
+    diagnostics.region_base_x = copied_input ? crop_src_x : region.base_x;
+    diagnostics.region_base_y = copied_input ? crop_src_y : region.base_y;
     diagnostics.region_width = region.width;
     diagnostics.region_height = region.height;
     diagnostics.working_width = working_width;
@@ -1776,7 +2413,13 @@ bool evaluate_dlss_nr(
         static_cast<std::uint64_t>(region.width) * region.height * 8U +
         static_cast<std::uint64_t>(working_width) * working_height * 16U;
     if (!ngx_succeeded(result)) {
-        restore_original_color(frame, *gpu, codec_region);
+        restore_original_color(work, *gpu, codec_region);
+        if (copied_input) {
+            transition(
+                work.command_list, game_color,
+                D3D12_RESOURCE_STATE_COPY_SOURCE, game_color_state
+            );
+        }
         diagnostics.state = DlssNrState::evaluation_failed;
         ++diagnostics.failed_calls;
         trace_event(
@@ -1787,71 +2430,114 @@ bool evaluate_dlss_nr(
         return false;
     }
 
+    record_color_samples(
+        view,
+        *gpu,
+        work.command_list,
+        nr_settings,
+        color_desc.Format
+    );
     transition(
-        frame.command_list,
+        work.command_list,
         gpu->neural_output,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
     );
     transition(
-        frame.command_list,
-        frame.color,
+        work.command_list,
+        work.color,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS
     );
     dispatch_codec(
-        frame,
+        work,
         *gpu,
         gpu->decode_pipeline,
         1U,
         6U,
         settings,
-        codec_region
+        codec_region,
+        hdr_mode
     );
-    uav_barrier(frame.command_list, frame.color);
+    uav_barrier(work.command_list, work.color);
     transition(
-        frame.command_list,
-        frame.color,
+        work.command_list,
+        work.color,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        frame.color_state
+        work.color_state
     );
+    if (copied_input) {
+        transition(
+            work.command_list, work.color,
+            work.color_state, D3D12_RESOURCE_STATE_COPY_SOURCE
+        );
+        transition(
+            work.command_list, game_color,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST
+        );
+        copy_texture_region(
+            work.command_list, game_color, crop_src_x, crop_src_y,
+            work.color, 0U, 0U, region.width, region.height
+        );
+        transition(
+            work.command_list, game_color,
+            D3D12_RESOURCE_STATE_COPY_DEST, game_color_state
+        );
+        transition(
+            work.command_list, work.color,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        );
+    }
     transition(
-        frame.command_list,
+        work.command_list,
         gpu->original_output,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS
     );
     transition(
-        frame.command_list,
+        work.command_list,
         gpu->color_proxy,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS
     );
     transition(
-        frame.command_list,
+        work.command_list,
         gpu->neural_output,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS
     );
     ++diagnostics.evaluation_calls;
     diagnostics.state = DlssNrState::active;
-    if (diagnostics.evaluation_calls == 1U ||
-        diagnostics.evaluation_calls % 300U == 0U) {
+    if (diagnostics.evaluation_calls == 1U) {
         trace_event(
             "DLSS-NR active route=%s view=%llu region=%ux%u@%u,%u "
-            "working=%ux%u evaluations=%llu",
-            dlss_nr_route_name(frame.route),
+            "working=%ux%u evaluations=%llu pre_upscale=%s polish=%s hdr=%s "
+            "flags=0x%X game_flags=0x%X format=0x%X",
+            dlss_nr_route_name(work.route),
             static_cast<unsigned long long>(frame.view_id),
             region.width,
             region.height,
-            region.base_x,
-            region.base_y,
+            copied_input ? crop_src_x : region.base_x,
+            copied_input ? crop_src_y : region.base_y,
             working_width,
             working_height,
-            static_cast<unsigned long long>(diagnostics.evaluation_calls)
+            static_cast<unsigned long long>(diagnostics.evaluation_calls),
+            work.pre_upscale ? "yes" : "no",
+            work.after_polish ? "yes" : "no",
+            "reinhard-detail",
+            nr_feature_create_flags(work.create_flags),
+            work.create_flags,
+            static_cast<unsigned>(color_desc.Format)
         );
     }
     return true;
+}
+
+void flush_dlss_nr_color_samples() noexcept {
+    std::lock_guard lock(nr_mutex);
+    for (auto& view : views) log_pending_color_samples(view);
 }
 
 void release_dlss_nr_view(const DlssViewId view_id) noexcept {

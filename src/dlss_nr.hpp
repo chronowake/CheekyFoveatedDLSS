@@ -59,6 +59,12 @@ struct DlssNrFrame {
     bool color_is_region{};
     FoveationGeometry shared_sr_crop{};
     bool has_shared_sr_crop{};
+    bool pre_upscale{};
+    bool after_polish{};
+    std::uint32_t output_base_x{};
+    std::uint32_t output_base_y{};
+    float jitter_x{};
+    float jitter_y{};
 };
 
 struct DlssNrGeometry {
@@ -113,6 +119,8 @@ void pump_dlss_nr_runtime() noexcept;
 void release_dlss_nr_view(DlssViewId view_id) noexcept;
 void release_dlss_nr_resources() noexcept;
 void reset_dlss_nr() noexcept;
+
+void flush_dlss_nr_color_samples() noexcept;
 
 [[nodiscard]] DlssNrSnapshot dlss_nr_snapshot() noexcept;
 [[nodiscard]] const char* dlss_nr_state_name(DlssNrState state) noexcept;

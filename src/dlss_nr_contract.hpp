@@ -52,6 +52,24 @@ struct DlssNrDisplayedView {
     std::uint32_t travel_height = 0U
 ) noexcept;
 
+// Before-NR canvas from this evaluate's NGX sizes. Recomputed every frame so
+// resolution and DLSS quality changes apply without a game-specific path.
+// Packed stereo keeps the full Color allocation. An output-sized Color with a
+// smaller render subrect (HZD Balanced) stays on the subrect. Otherwise a
+// Color allocation larger than the NGX rect is input-space padding (AFOP).
+[[nodiscard]] DlssNrDisplayedView dlss_nr_pre_upscale_canvas(
+    std::uint32_t input_width,
+    std::uint32_t input_height,
+    std::uint32_t output_width,
+    std::uint32_t output_height,
+    std::uint32_t color_width,
+    std::uint32_t color_height
+) noexcept;
+
+// Cheap foveal after-SR pass used with NR-before. Tightens the crop, halves
+// working scale, and lowers blend so it is not a second full-strength NR.
+void apply_nr_after_polish(Settings& settings) noexcept;
+
 // Gaze u/v is 0-1 in that eye's displayed view. Adds a span-normalized offset
 // on top of the origin sliders so those sliders stay a bias / fallback.
 void apply_nr_gaze_uv(

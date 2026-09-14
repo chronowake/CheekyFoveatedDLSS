@@ -76,6 +76,61 @@ DlssNrDisplayedView dlss_nr_displayed_view(
     };
 }
 
+DlssNrDisplayedView dlss_nr_pre_upscale_canvas(
+    const std::uint32_t input_width,
+    const std::uint32_t input_height,
+    const std::uint32_t output_width,
+    const std::uint32_t output_height,
+    const std::uint32_t color_width,
+    const std::uint32_t color_height
+) noexcept {
+    const auto input_w = input_width == 0U ? color_width : input_width;
+    const auto input_h = input_height == 0U ? color_height : input_height;
+    const auto color_w = color_width == 0U ? input_w : color_width;
+    const auto color_h = color_height == 0U ? input_h : color_height;
+    const auto packed_sbs =
+        input_w != 0U && color_w >= input_w * 2U &&
+        (input_h == 0U || color_h < input_h * 2U);
+    const auto packed_tab =
+        input_h != 0U && color_h >= input_h * 2U &&
+        (input_w == 0U || color_w < input_w * 2U);
+    if (packed_sbs || packed_tab) {
+        return dlss_nr_displayed_view(
+            input_w, input_h, color_w, color_h
+        );
+    }
+    const bool output_sized_color =
+        output_width != 0U && output_height != 0U &&
+        color_w + 8U >= output_width && color_h + 8U >= output_height &&
+        (color_w > input_w + 8U || color_h > input_h + 8U);
+    if (output_sized_color) {
+        return dlss_nr_displayed_view(input_w, input_h, input_w, input_h);
+    }
+    return dlss_nr_displayed_view(
+        input_w,
+        input_h,
+        (std::max)(input_w, color_w),
+        (std::max)(input_h, color_h)
+    );
+}
+
+void apply_nr_after_polish(Settings& settings) noexcept {
+    settings.nr_foveated = true;
+    settings.nr_width = std::clamp(settings.nr_width * 0.70F, 0.20F, 1.0F);
+    settings.nr_height = std::clamp(settings.nr_height * 0.70F, 0.20F, 1.0F);
+    settings.nr_working_scale =
+        std::clamp(settings.nr_working_scale * 0.50F, 0.10F, 0.50F);
+    settings.nr_color_strength = std::clamp(
+        settings.nr_color_strength * 0.40F, 0.0F, 1.0F
+    );
+    settings.nr_hdr_transfer_strength = std::clamp(
+        settings.nr_hdr_transfer_strength * 0.50F, 0.0F, 1.0F
+    );
+    settings.nr_transition_width = std::clamp(
+        (std::max)(settings.nr_transition_width, 0.08F), 0.0F, 0.30F
+    );
+}
+
 void apply_nr_gaze_uv(
     Settings& settings,
     const float gaze_u,
